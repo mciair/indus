@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
     time::Instant,
@@ -7,6 +8,7 @@ use std::{
 use ratatui::layout::Rect;
 
 use crate::{
+    harness::event::{FileDiff, HarnessEvent, PermissionReply, RunOutcome},
     slash::{COMMANDS, CompletionPhase, SlashMenu},
     theme::ThemeKind,
 };
@@ -54,6 +56,7 @@ pub struct HitZones {
     pub menu: Vec<(Rect, MenuAction)>,
     pub alpha: Option<Rect>,
     pub slash_rows: Vec<(Rect, usize)>,
+    pub fold_rows: Vec<(Rect, usize)>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -149,8 +152,6 @@ impl Composer {
     }
 }
 
-/// Transcript variants are populated by the transport adapter as stream events arrive.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TranscriptEntry {
     User {
@@ -158,19 +159,38 @@ pub enum TranscriptEntry {
         slash_tokens: Vec<Range<usize>>,
     },
     Thinking {
+        id: String,
         text: String,
         running: bool,
         elapsed_ms: Option<u128>,
+        expanded: bool,
     },
     Assistant {
+        id: String,
         text: String,
         streaming: bool,
+    },
+    Tool {
+        call_id: String,
+        name: String,
+        description: String,
+        input: String,
+        output: String,
+        state: ToolVisualState,
+        elapsed_ms: Option<u128>,
+        expanded: bool,
+        diffs: Vec<FileDiff>,
     },
     Event(String),
 }
 
-/// Live activity reported by the Indus agent transport.
-#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ToolVisualState {
+    Running,
+    Succeeded,
+    Failed(String),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TurnActivity {
     WaitingForResponse,
@@ -178,6 +198,7 @@ pub enum TurnActivity {
     Responding,
     RunningTool(String),
     Retrying(u16),
+    WaitingForPermission,
     Cancelling,
 }
 
@@ -189,38 +210,42 @@ impl TurnActivity {
             Self::Responding => "Responding…".to_string(),
             Self::RunningTool(tool) => format!("Run {tool}"),
             Self::Retrying(attempt) => format!("Retrying (attempt {attempt})…"),
+            Self::WaitingForPermission => "Waiting for permission…".to_string(),
             Self::Cancelling => "Cancelling…".to_string(),
         }
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ActiveTurn {
+    pub run_id: Option<u64>,
     pub activity: TurnActivity,
     pub started_at: Instant,
     pub activity_started_at: Instant,
-    pub thinking_entry: Option<usize>,
-    pub assistant_entry: Option<usize>,
 }
 
 impl ActiveTurn {
     fn new() -> Self {
         let now = Instant::now();
         Self {
+            run_id: None,
             activity: TurnActivity::WaitingForResponse,
             started_at: now,
             activity_started_at: now,
-            thinking_entry: None,
-            assistant_entry: None,
         }
     }
 
-    #[allow(dead_code)]
     fn set_activity(&mut self, activity: TurnActivity) {
         self.activity = activity;
         self.activity_started_at = Instant::now();
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PermissionPrompt {
+    pub request_id: u64,
+    pub description: String,
+    pub patterns: Vec<String>,
 }
 
 pub struct App {
@@ -233,9 +258,15 @@ pub struct App {
     pub theme_kind: ThemeKind,
     pub preview_theme: Option<ThemeKind>,
     pub turn: Option<ActiveTurn>,
+    pub permission: Option<PermissionPrompt>,
     pub animation_tick: u64,
     pub running: bool,
     pub hit_zones: HitZones,
+    pending_submission: Option<String>,
+    pending_permission_reply: Option<(u64, PermissionReply)>,
+    thinking_entries: HashMap<String, (usize, Instant)>,
+    assistant_entries: HashMap<String, usize>,
+    tool_entries: HashMap<String, (usize, Instant)>,
 }
 
 impl App {
@@ -255,9 +286,15 @@ impl App {
             theme_kind,
             preview_theme: None,
             turn: None,
+            permission: None,
             animation_tick: 0,
             running: true,
             hit_zones: HitZones::default(),
+            pending_submission: None,
+            pending_permission_reply: None,
+            thinking_entries: HashMap::new(),
+            assistant_entries: HashMap::new(),
+            tool_entries: HashMap::new(),
         }
     }
 
@@ -332,12 +369,38 @@ impl App {
             return;
         }
 
+        if self.turn.is_some() {
+            return;
+        }
+
         let slash_tokens = recognized_slash_tokens(&text);
-        self.transcript
-            .push(TranscriptEntry::User { text, slash_tokens });
+        self.transcript.push(TranscriptEntry::User {
+            text: text.clone(),
+            slash_tokens,
+        });
         self.composer.clear();
         self.close_slash();
         self.turn = Some(ActiveTurn::new());
+        self.pending_submission = Some(text);
+    }
+
+    pub fn take_submission(&mut self) -> Option<String> {
+        self.pending_submission.take()
+    }
+
+    pub fn take_permission_reply(&mut self) -> Option<(u64, PermissionReply)> {
+        self.pending_permission_reply.take()
+    }
+
+    pub fn resolve_permission(&mut self, reply: PermissionReply) -> bool {
+        let Some(prompt) = self.permission.take() else {
+            return false;
+        };
+        self.pending_permission_reply = Some((prompt.request_id, reply));
+        if let Some(turn) = self.turn.as_mut() {
+            turn.set_activity(TurnActivity::WaitingForResponse);
+        }
+        true
     }
 
     pub fn run_menu_action(&mut self, action: MenuAction) {
@@ -355,96 +418,244 @@ impl App {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn begin_thinking(&mut self) {
-        let Some(turn) = self.turn.as_mut() else {
-            return;
-        };
-        turn.set_activity(TurnActivity::Thinking);
-        let entry = self.transcript.len();
-        self.transcript.push(TranscriptEntry::Thinking {
-            text: String::new(),
-            running: true,
-            elapsed_ms: None,
-        });
-        turn.thinking_entry = Some(entry);
-    }
-
-    #[allow(dead_code)]
-    pub fn push_thinking(&mut self, chunk: &str) {
-        if self.turn.is_none() {
-            return;
-        }
-        let Some(index) = self.turn.as_ref().and_then(|turn| turn.thinking_entry) else {
-            self.begin_thinking();
-            return self.push_thinking(chunk);
-        };
-        if let Some(TranscriptEntry::Thinking { text, .. }) = self.transcript.get_mut(index) {
-            text.push_str(chunk);
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn begin_responding(&mut self) {
-        let Some(turn) = self.turn.as_mut() else {
-            return;
-        };
-        if let Some(index) = turn.thinking_entry
-            && let Some(TranscriptEntry::Thinking {
-                running,
-                elapsed_ms,
+    pub fn apply_harness_event(&mut self, event: HarnessEvent) {
+        match event {
+            HarnessEvent::RunStarted { run_id } => {
+                if let Some(turn) = self.turn.as_mut() {
+                    turn.run_id = Some(run_id);
+                    turn.set_activity(TurnActivity::WaitingForResponse);
+                }
+            }
+            HarnessEvent::WaitingForResponse { .. } => {
+                self.set_turn_activity(TurnActivity::WaitingForResponse)
+            }
+            HarnessEvent::ReasoningStarted { reasoning_id, .. } => {
+                self.set_turn_activity(TurnActivity::Thinking);
+                let index = self.transcript.len();
+                self.transcript.push(TranscriptEntry::Thinking {
+                    id: reasoning_id.clone(),
+                    text: String::new(),
+                    running: true,
+                    elapsed_ms: None,
+                    expanded: true,
+                });
+                self.thinking_entries
+                    .insert(reasoning_id, (index, Instant::now()));
+            }
+            HarnessEvent::ReasoningDelta {
+                reasoning_id, text, ..
+            } => {
+                if let Some((index, _)) = self.thinking_entries.get(&reasoning_id)
+                    && let Some(TranscriptEntry::Thinking { text: body, .. }) =
+                        self.transcript.get_mut(*index)
+                {
+                    body.push_str(&text);
+                }
+            }
+            HarnessEvent::ReasoningFinished { reasoning_id, .. } => {
+                if let Some((index, started_at)) = self.thinking_entries.remove(&reasoning_id)
+                    && let Some(TranscriptEntry::Thinking {
+                        running,
+                        elapsed_ms,
+                        expanded,
+                        ..
+                    }) = self.transcript.get_mut(index)
+                {
+                    *running = false;
+                    *elapsed_ms = Some(started_at.elapsed().as_millis());
+                    *expanded = false;
+                }
+            }
+            HarnessEvent::TextStarted { text_id, .. } => {
+                self.set_turn_activity(TurnActivity::Responding);
+                let index = self.transcript.len();
+                self.transcript.push(TranscriptEntry::Assistant {
+                    id: text_id.clone(),
+                    text: String::new(),
+                    streaming: true,
+                });
+                self.assistant_entries.insert(text_id, index);
+            }
+            HarnessEvent::TextDelta { text_id, text, .. } => {
+                if let Some(index) = self.assistant_entries.get(&text_id)
+                    && let Some(TranscriptEntry::Assistant { text: body, .. }) =
+                        self.transcript.get_mut(*index)
+                {
+                    body.push_str(&text);
+                }
+            }
+            HarnessEvent::TextFinished { text_id, .. } => {
+                if let Some(index) = self.assistant_entries.remove(&text_id)
+                    && let Some(TranscriptEntry::Assistant { streaming, .. }) =
+                        self.transcript.get_mut(index)
+                {
+                    *streaming = false;
+                }
+            }
+            HarnessEvent::ToolStarted {
+                call_id,
+                name,
+                description,
+                input,
                 ..
-            }) = self.transcript.get_mut(index)
-        {
-            *running = false;
-            *elapsed_ms = Some(turn.activity_started_at.elapsed().as_millis());
+            } => {
+                self.set_turn_activity(TurnActivity::RunningTool(name.clone()));
+                let index = self.transcript.len();
+                self.transcript.push(TranscriptEntry::Tool {
+                    call_id: call_id.clone(),
+                    name,
+                    description,
+                    input,
+                    output: String::new(),
+                    state: ToolVisualState::Running,
+                    elapsed_ms: None,
+                    expanded: false,
+                    diffs: Vec::new(),
+                });
+                self.tool_entries.insert(call_id, (index, Instant::now()));
+            }
+            HarnessEvent::ToolOutput { call_id, text, .. } => {
+                if let Some((index, _)) = self.tool_entries.get(&call_id)
+                    && let Some(TranscriptEntry::Tool { output, .. }) =
+                        self.transcript.get_mut(*index)
+                {
+                    output.push_str(&text);
+                }
+            }
+            HarnessEvent::ToolFinished {
+                call_id,
+                title,
+                output,
+                diffs,
+                ..
+            } => {
+                if let Some((index, started_at)) = self.tool_entries.remove(&call_id)
+                    && let Some(TranscriptEntry::Tool {
+                        description,
+                        output: body,
+                        state,
+                        elapsed_ms,
+                        diffs: body_diffs,
+                        ..
+                    }) = self.transcript.get_mut(index)
+                {
+                    if !title.trim().is_empty() {
+                        *description = title;
+                    }
+                    if !output.is_empty() {
+                        *body = output;
+                    }
+                    *state = ToolVisualState::Succeeded;
+                    *elapsed_ms = Some(started_at.elapsed().as_millis());
+                    *body_diffs = diffs;
+                }
+                self.set_turn_activity(TurnActivity::WaitingForResponse);
+            }
+            HarnessEvent::ToolFailed {
+                call_id, message, ..
+            } => {
+                if let Some((index, started_at)) = self.tool_entries.remove(&call_id)
+                    && let Some(TranscriptEntry::Tool {
+                        state,
+                        elapsed_ms,
+                        expanded,
+                        ..
+                    }) = self.transcript.get_mut(index)
+                {
+                    *state = ToolVisualState::Failed(message);
+                    *elapsed_ms = Some(started_at.elapsed().as_millis());
+                    *expanded = true;
+                }
+            }
+            HarnessEvent::PermissionRequested {
+                request_id,
+                patterns,
+                description,
+                ..
+            } => {
+                self.permission = Some(PermissionPrompt {
+                    request_id,
+                    description,
+                    patterns,
+                });
+                self.set_turn_activity(TurnActivity::WaitingForPermission);
+            }
+            HarnessEvent::RetryScheduled { attempt, .. } => {
+                self.set_turn_activity(TurnActivity::Retrying(attempt));
+            }
+            HarnessEvent::CompactionRequired { .. } => self.transcript.push(
+                TranscriptEntry::Event("Conversation compaction required.".to_string()),
+            ),
+            HarnessEvent::RunError { message, .. } => {
+                self.transcript.push(TranscriptEntry::Event(message));
+            }
+            HarnessEvent::RunFinished { run_id, outcome } => {
+                self.finish_turn(run_id, outcome);
+            }
         }
-        turn.set_activity(TurnActivity::Responding);
-        let entry = self.transcript.len();
-        self.transcript.push(TranscriptEntry::Assistant {
-            text: String::new(),
-            streaming: true,
+    }
+
+    pub fn toggle_fold(&mut self, index: usize) {
+        match self.transcript.get_mut(index) {
+            Some(TranscriptEntry::Thinking { expanded, .. })
+            | Some(TranscriptEntry::Tool { expanded, .. }) => *expanded = !*expanded,
+            _ => {}
+        }
+    }
+
+    pub fn toggle_all_thinking(&mut self) {
+        let expand = self.transcript.iter().any(|entry| {
+            matches!(
+                entry,
+                TranscriptEntry::Thinking {
+                    expanded: false,
+                    ..
+                }
+            )
         });
-        turn.assistant_entry = Some(entry);
-    }
-
-    #[allow(dead_code)]
-    pub fn push_response(&mut self, chunk: &str) {
-        if self.turn.is_none() {
-            return;
+        for entry in &mut self.transcript {
+            if let TranscriptEntry::Thinking { expanded, .. } = entry {
+                *expanded = expand;
+            }
         }
-        let Some(index) = self.turn.as_ref().and_then(|turn| turn.assistant_entry) else {
-            self.begin_responding();
-            return self.push_response(chunk);
-        };
-        if let Some(TranscriptEntry::Assistant { text, .. }) = self.transcript.get_mut(index) {
-            text.push_str(chunk);
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn finish_turn(&mut self) {
-        let Some(turn) = self.turn.take() else {
-            return;
-        };
-        if let Some(index) = turn.assistant_entry
-            && let Some(TranscriptEntry::Assistant { streaming, .. }) =
-                self.transcript.get_mut(index)
-        {
-            *streaming = false;
-        }
-        self.transcript.push(TranscriptEntry::Event(format!(
-            "Worked for {}",
-            format_elapsed(turn.started_at.elapsed().as_millis())
-        )));
     }
 
     pub fn cancel_turn(&mut self) {
-        if self.turn.take().is_some() {
-            self.transcript.push(TranscriptEntry::Event(
-                "Turn cancelled by user.".to_string(),
-            ));
+        if let Some(turn) = self.turn.as_mut() {
+            turn.set_activity(TurnActivity::Cancelling);
         }
+    }
+
+    fn set_turn_activity(&mut self, activity: TurnActivity) {
+        if let Some(turn) = self.turn.as_mut() {
+            turn.set_activity(activity);
+        }
+    }
+
+    fn finish_turn(&mut self, run_id: u64, outcome: RunOutcome) {
+        let Some(turn) = self.turn.take() else {
+            return;
+        };
+        self.permission = None;
+        self.thinking_entries.clear();
+        self.assistant_entries.clear();
+        self.tool_entries.clear();
+        let elapsed = format_elapsed(turn.started_at.elapsed().as_millis());
+        let message = match outcome {
+            RunOutcome::Completed => {
+                let verb = if run_id % 2 == 0 {
+                    "Delegated"
+                } else {
+                    "Worked"
+                };
+                format!("{verb} for {elapsed}")
+            }
+            RunOutcome::Cancelled => format!("Turn cancelled by user in {elapsed}."),
+            RunOutcome::Failed => format!("Turn failed in {elapsed}."),
+            RunOutcome::CompactionRequired => format!("Paused for compaction after {elapsed}."),
+            RunOutcome::StepLimitReached => format!("Step limit reached in {elapsed}."),
+        };
+        self.transcript.push(TranscriptEntry::Event(message));
     }
 
     pub fn on_tick(&mut self) {
@@ -579,7 +790,6 @@ fn recognized_slash_tokens(text: &str) -> Vec<Range<usize>> {
         .collect()
 }
 
-#[allow(dead_code)]
 fn format_elapsed(milliseconds: u128) -> String {
     if milliseconds < 60_000 {
         format!("{:.1}s", milliseconds as f64 / 1_000.0)
@@ -618,14 +828,51 @@ mod tests {
         let mut app = App::new();
         app.composer.set("hello");
         app.submit();
-        app.begin_thinking();
-        app.push_thinking("Considering the request");
-        app.begin_responding();
-        app.push_response("Done");
-        app.finish_turn();
+        app.apply_harness_event(HarnessEvent::RunStarted { run_id: 1 });
+        app.apply_harness_event(HarnessEvent::ReasoningStarted {
+            run_id: 1,
+            reasoning_id: "r1".into(),
+        });
+        app.apply_harness_event(HarnessEvent::ReasoningDelta {
+            run_id: 1,
+            reasoning_id: "r1".into(),
+            text: "Considering the request".into(),
+        });
+        app.apply_harness_event(HarnessEvent::ReasoningFinished {
+            run_id: 1,
+            reasoning_id: "r1".into(),
+        });
+        app.apply_harness_event(HarnessEvent::RunFinished {
+            run_id: 1,
+            outcome: RunOutcome::Completed,
+        });
         assert!(matches!(
             app.transcript.last(),
             Some(TranscriptEntry::Event(text)) if text.starts_with("Worked for ")
+        ));
+    }
+
+    #[test]
+    fn finished_thinking_collapses_with_elapsed_time() {
+        let mut app = App::new();
+        app.composer.set("hello");
+        app.submit();
+        app.apply_harness_event(HarnessEvent::ReasoningStarted {
+            run_id: 1,
+            reasoning_id: "r1".into(),
+        });
+        app.apply_harness_event(HarnessEvent::ReasoningFinished {
+            run_id: 1,
+            reasoning_id: "r1".into(),
+        });
+        assert!(matches!(
+            &app.transcript[1],
+            TranscriptEntry::Thinking {
+                running: false,
+                elapsed_ms: Some(_),
+                expanded: false,
+                ..
+            }
         ));
     }
 }
