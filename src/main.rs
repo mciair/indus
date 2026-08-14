@@ -1,4 +1,5 @@
 mod app;
+mod harness;
 mod slash;
 mod theme;
 mod ui;
