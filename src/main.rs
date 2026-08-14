@@ -5,7 +5,11 @@ mod slash;
 mod theme;
 mod ui;
 
-use std::{io, process::Command, time::Duration};
+use std::{
+    io::{self, Write},
+    process::{Command, Stdio},
+    time::Duration,
+};
 
 use anyhow::Result;
 use app::App;
@@ -107,6 +111,28 @@ fn handle_key(app: &mut App, harness: &Harness, key: KeyEvent) {
 
     if app.slash.open && handle_slash_key(app, key) {
         return;
+    }
+
+    if app.catalog_modal.is_none() && !app.transcript.is_empty() {
+        match key.code {
+            KeyCode::PageUp => {
+                app.page_transcript_up();
+                return;
+            }
+            KeyCode::PageDown => {
+                app.page_transcript_down();
+                return;
+            }
+            KeyCode::Home if key.modifiers == KeyModifiers::CONTROL => {
+                app.scroll_transcript_to_top();
+                return;
+            }
+            KeyCode::End if key.modifiers == KeyModifiers::CONTROL => {
+                app.scroll_transcript_to_bottom();
+                return;
+            }
+            _ => {}
+        }
     }
 
     match key.code {
@@ -232,11 +258,43 @@ fn handle_slash_key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
-    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-        return;
-    }
     let x = mouse.column;
     let y = mouse.row;
+    match mouse.kind {
+        MouseEventKind::ScrollUp
+            if app.catalog_modal.is_none() && app.transcript_contains(x, y) =>
+        {
+            app.scroll_transcript_up(3);
+            return;
+        }
+        MouseEventKind::ScrollDown
+            if app.catalog_modal.is_none() && app.transcript_contains(x, y) =>
+        {
+            app.scroll_transcript_down(3);
+            return;
+        }
+        MouseEventKind::Drag(MouseButton::Left) if app.is_selecting_text() => {
+            app.update_text_selection(x, y);
+            return;
+        }
+        MouseEventKind::Up(MouseButton::Left) if app.is_selecting_text() => {
+            if let Some(text) = app.finish_text_selection() {
+                copy_to_clipboard(&text);
+                return;
+            }
+            let fold_hit = app
+                .hit_zones
+                .fold_rows
+                .iter()
+                .find_map(|(area, index)| contains(*area, x, y).then_some(*index));
+            if let Some(index) = fold_hit {
+                app.toggle_fold(index);
+            }
+            return;
+        }
+        MouseEventKind::Down(MouseButton::Left) => {}
+        _ => return,
+    }
     if app.catalog_modal.is_some() {
         let catalog_hit = app
             .hit_zones
@@ -251,16 +309,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     }
     if app.hit_zones.alpha.is_some_and(|area| contains(area, x, y)) {
         open_alpha();
-        return;
-    }
-
-    let fold_hit = app
-        .hit_zones
-        .fold_rows
-        .iter()
-        .find_map(|(area, index)| contains(*area, x, y).then_some(*index));
-    if let Some(index) = fold_hit {
-        app.toggle_fold(index);
         return;
     }
 
@@ -287,6 +335,20 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     if let Some((index, action)) = menu_hit {
         app.selected_menu = index;
         app.run_menu_action(action);
+        return;
+    }
+
+    if app.begin_text_selection(x, y) {
+        return;
+    }
+
+    let fold_hit = app
+        .hit_zones
+        .fold_rows
+        .iter()
+        .find_map(|(area, index)| contains(*area, x, y).then_some(*index));
+    if let Some(index) = fold_hit {
+        app.toggle_fold(index);
     }
 }
 
@@ -322,4 +384,83 @@ fn open_alpha() {
     } else {
         Command::new("xdg-open").arg(ui::ALPHA_URL).status()
     };
+}
+
+fn copy_to_clipboard(text: &str) {
+    let commands: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else if cfg!(target_os = "windows") {
+        &[("clip", &[])]
+    } else {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+            ("clip.exe", &[]),
+        ]
+    };
+    if commands
+        .iter()
+        .any(|(program, arguments)| write_clipboard_command(program, arguments, text))
+    {
+        return;
+    }
+
+    let encoded = encode_base64(text.as_bytes());
+    let mut stdout = io::stdout();
+    let _ = write!(stdout, "\x1b]52;c;{encoded}\x07");
+    let _ = stdout.flush();
+}
+
+fn write_clipboard_command(program: &str, arguments: &[&str], text: &str) -> bool {
+    let Ok(mut child) = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let wrote = child
+        .stdin
+        .take()
+        .is_some_and(|mut input| input.write_all(text.as_bytes()).is_ok());
+    let succeeded = child.wait().is_ok_and(|status| status.success());
+    wrote && succeeded
+}
+
+fn encode_base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        output.push(ALPHABET[(first >> 2) as usize] as char);
+        output.push(ALPHABET[(((first & 0b11) << 4) | (second >> 4)) as usize] as char);
+        output.push(if chunk.len() > 1 {
+            ALPHABET[(((second & 0b1111) << 2) | (third >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            ALPHABET[(third & 0b11_1111) as usize] as char
+        } else {
+            '='
+        });
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_base64;
+
+    #[test]
+    fn osc52_payload_uses_standard_base64_padding() {
+        assert_eq!(encode_base64(b"Indus"), "SW5kdXM=");
+        assert_eq!(encode_base64(b"AI"), "QUk=");
+        assert_eq!(encode_base64(b"CLI"), "Q0xJ");
+    }
 }
