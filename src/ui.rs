@@ -1421,6 +1421,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     output
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_horizontal_border(
     buffer: &mut Buffer,
     left: u16,
