@@ -355,11 +355,11 @@ fn parse_clock(value: &str) -> Option<(u32, u32)> {
 }
 
 fn duration_label(milliseconds: u64) -> String {
-    if milliseconds % 3_600_000 == 0 {
+    if milliseconds.is_multiple_of(3_600_000) {
         format!("{}h", milliseconds / 3_600_000)
-    } else if milliseconds % 60_000 == 0 {
+    } else if milliseconds.is_multiple_of(60_000) {
         format!("{}m", milliseconds / 60_000)
-    } else if milliseconds % 1_000 == 0 {
+    } else if milliseconds.is_multiple_of(1_000) {
         format!("{}s", milliseconds / 1_000)
     } else {
         format!("{milliseconds}ms")
