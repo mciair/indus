@@ -9,7 +9,7 @@ pub enum RunOutcome {
     StepLimitReached,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PermissionReply {
     AllowOnce,
     AllowAlways,
