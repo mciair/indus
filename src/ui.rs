@@ -1169,4 +1169,82 @@ mod tests {
     fn slash_dropdown_stays_at_six_visible_rows() {
         assert_eq!(MAX_SLASH_ROWS, 6);
     }
+
+    #[test]
+    fn streamed_thinking_shows_its_body_until_completion() {
+        let theme = Theme::for_preference(crate::theme::ThemeKind::IndusNight);
+        let entry = TranscriptEntry::Thinking {
+            id: "r1".into(),
+            text: "Inspecting the workspace".into(),
+            running: true,
+            elapsed_ms: None,
+            expanded: true,
+        };
+        let mut rows = Vec::new();
+        build_transcript_rows(&mut rows, 0, &entry, 80, &theme);
+        assert_eq!(plain_line(&rows[0].line), "● Thinking…");
+        assert!(
+            rows.iter()
+                .any(|row| plain_line(&row.line).contains("Inspecting the workspace"))
+        );
+    }
+
+    #[test]
+    fn completed_thinking_collapses_to_a_timed_header() {
+        let theme = Theme::for_preference(crate::theme::ThemeKind::IndusNight);
+        let entry = TranscriptEntry::Thinking {
+            id: "r1".into(),
+            text: "Hidden reasoning".into(),
+            running: false,
+            elapsed_ms: Some(1_250),
+            expanded: false,
+        };
+        let mut rows = Vec::new();
+        build_transcript_rows(&mut rows, 0, &entry, 80, &theme);
+        assert_eq!(rows.len(), 1);
+        assert!(plain_line(&rows[0].line).starts_with("● Thought for 1.2s"));
+    }
+
+    #[test]
+    fn collapsed_edit_header_reports_line_changes() {
+        let theme = Theme::for_preference(crate::theme::ThemeKind::IndusNight);
+        let entry = TranscriptEntry::Tool {
+            call_id: "call-1".into(),
+            name: "edit".into(),
+            description: "Edit source".into(),
+            input: String::new(),
+            output: String::new(),
+            state: ToolVisualState::Succeeded,
+            elapsed_ms: Some(100),
+            expanded: false,
+            diffs: vec![FileDiff {
+                path: "src/main.rs".into(),
+                lines: vec![
+                    crate::harness::event::DiffLine {
+                        old_line: Some(1),
+                        new_line: None,
+                        kind: DiffKind::Removed,
+                        text: "old".into(),
+                    },
+                    crate::harness::event::DiffLine {
+                        old_line: None,
+                        new_line: Some(1),
+                        kind: DiffKind::Added,
+                        text: "new".into(),
+                    },
+                ],
+            }],
+        };
+        let mut rows = Vec::new();
+        build_transcript_rows(&mut rows, 0, &entry, 80, &theme);
+        assert_eq!(plain_line(&rows[0].line), "● Edit src/main.rs +1/-1");
+        assert_eq!(rows[0].line.spans[0].style.fg, Some(theme.accent_success));
+    }
+
+    fn plain_line(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
 }
