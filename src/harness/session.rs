@@ -198,14 +198,15 @@ impl Session {
         count
     }
 
-    pub fn total_usage(&self) -> u64 {
+    pub fn current_context_tokens(&self) -> u64 {
         self.messages
             .iter()
-            .filter_map(|message| match message {
-                SessionMessage::Assistant(assistant) => Some(assistant.usage.total()),
+            .rev()
+            .find_map(|message| match message {
+                SessionMessage::Assistant(assistant) => Some(assistant.usage.context_tokens),
                 SessionMessage::User(_) => None,
             })
-            .fold(0, u64::saturating_add)
+            .unwrap_or(0)
     }
 
     pub fn summary_source(&self, max_characters: usize) -> String {
@@ -303,5 +304,20 @@ mod tests {
         let first = session.push_user("first");
         let second = session.next_assistant(first).id;
         assert!(second > first);
+    }
+
+    #[test]
+    fn context_occupancy_uses_the_latest_request_instead_of_cumulative_usage() {
+        let mut session = Session::default();
+        let first_user = session.push_user("first");
+        let mut first_assistant = session.next_assistant(first_user);
+        first_assistant.usage.context_tokens = 70_000;
+        session.push_assistant(first_assistant);
+        let second_user = session.push_user("second");
+        let mut second_assistant = session.next_assistant(second_user);
+        second_assistant.usage.context_tokens = 80_000;
+        session.push_assistant(second_assistant);
+
+        assert_eq!(session.current_context_tokens(), 80_000);
     }
 }
