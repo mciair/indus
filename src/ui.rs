@@ -1,9 +1,10 @@
 use std::{path::Path, process::Command};
 
+use chrono::{TimeZone, Utc};
 use ratatui::{
     Frame,
     buffer::Buffer,
-    layout::{Constraint, Flex, Layout, Margin, Rect},
+    layout::{Alignment, Constraint, Flex, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
@@ -82,6 +83,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     if app.catalog_modal.is_some() {
         render_catalog_modal(frame, prompt, app, &theme, &mut zones);
     }
+    if let Some(panel) = app.resume_panel.as_ref() {
+        render_resume_panel(frame, panel, &theme, &mut zones);
+    }
     app.hit_zones = zones;
 }
 
@@ -94,6 +98,214 @@ fn render_top_bar(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         Span::styled(collapse_home(&app.cwd), Style::default().fg(theme.gray_dim)),
     ]);
     frame.render_widget(Paragraph::new(line).style(theme.base()), area);
+    if let Some(title) = app.session_title.as_deref() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                truncate(title, area.width.saturating_sub(8) as usize),
+                Style::default().fg(theme.text_secondary),
+            ))
+            .alignment(Alignment::Right),
+            area,
+        );
+    }
+}
+
+fn render_resume_panel(
+    frame: &mut Frame<'_>,
+    state: &crate::app::ResumePanel,
+    theme: &Theme,
+    zones: &mut HitZones,
+) {
+    let sessions = state.visible_sessions();
+    let shown = sessions.len().min(8);
+    let detail_height = u16::from(state.expanded && !sessions.is_empty()) * 8;
+    let desired_height = 8 + shown as u16 + detail_height;
+    let width = frame.area().width.saturating_sub(4).clamp(48, 96);
+    let height = desired_height
+        .min(frame.area().height.saturating_sub(2))
+        .max(7);
+    let panel = centered_rect(frame.area(), width.min(frame.area().width), height);
+
+    frame.render_widget(Clear, panel);
+    frame.render_widget(
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.prompt_border))
+            .style(Style::default().bg(theme.bg_light)),
+        panel,
+    );
+    let inner = panel.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "Resume session",
+            Style::default()
+                .fg(theme.text_primary)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled("esc", Style::default().fg(theme.gray)))
+            .alignment(Alignment::Right),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+
+    let search = Rect::new(inner.x, inner.y + 2, inner.width, 1);
+    let search_text = if state.query.is_empty() {
+        "Search sessions".to_string()
+    } else {
+        state.query.text().to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("› ", Style::default().fg(theme.fuzzy_accent)),
+            Span::styled(
+                search_text,
+                Style::default().fg(if state.query.is_empty() {
+                    theme.gray
+                } else {
+                    theme.text_primary
+                }),
+            ),
+        ])),
+        search,
+    );
+
+    let rows_y = search.y + 2;
+    if sessions.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                if state.query.is_empty() {
+                    "No saved sessions yet"
+                } else {
+                    "No matching sessions"
+                },
+                Style::default().fg(theme.gray),
+            )),
+            Rect::new(inner.x, rows_y, inner.width, 1),
+        );
+    } else {
+        let start = state.selected.saturating_add(1).saturating_sub(shown);
+        for (offset, (index, session)) in sessions
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(shown)
+            .enumerate()
+        {
+            let row = Rect::new(inner.x, rows_y + offset as u16, inner.width, 1);
+            let selected = index == state.selected;
+            let background = if selected {
+                theme.bg_visual
+            } else {
+                theme.bg_light
+            };
+            fill(frame.buffer_mut(), row, Style::default().bg(background));
+            let relative = relative_time(session.updated_at);
+            let available = row.width.saturating_sub(relative.width() as u16 + 5) as usize;
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        if selected { "› " } else { "  " },
+                        Style::default().fg(theme.fuzzy_accent).bg(background),
+                    ),
+                    Span::styled(
+                        truncate(&session.title, available),
+                        Style::default()
+                            .fg(theme.text_primary)
+                            .bg(background)
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                ])),
+                row,
+            );
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    relative,
+                    Style::default().fg(theme.gray).bg(background),
+                ))
+                .alignment(Alignment::Right),
+                row,
+            );
+            zones.resume_rows.push((row, index));
+        }
+
+        if state.expanded
+            && let Some(session) = sessions.get(state.selected)
+        {
+            let details_y = rows_y + shown as u16 + 1;
+            let model = match (&session.provider_id, &session.model_id) {
+                (Some(provider), Some(model)) => format!("{provider} · {model}"),
+                (_, Some(model)) => model.clone(),
+                _ => "Unknown".to_string(),
+            };
+            let details = [
+                ("ID", session.id.clone()),
+                ("CWD", session.directory.clone()),
+                ("Model", model),
+                ("Created", absolute_time(session.created_at)),
+                ("Updated", absolute_time(session.updated_at)),
+                ("Messages", session.message_count.to_string()),
+                ("Prompt", session.first_prompt.replace('\n', " ")),
+            ];
+            for (offset, (label, value)) in details.into_iter().enumerate() {
+                let y = details_y + offset as u16;
+                if y >= inner.bottom().saturating_sub(1) {
+                    break;
+                }
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(format!("{label:<9}"), Style::default().fg(theme.gray)),
+                        Span::styled(
+                            truncate(&value, inner.width.saturating_sub(10) as usize),
+                            Style::default().fg(theme.text_secondary),
+                        ),
+                    ])),
+                    Rect::new(inner.x + 2, y, inner.width.saturating_sub(2), 1),
+                );
+            }
+        }
+    }
+
+    let footer = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "enter resume   ↑↓ navigate   tab details   esc close",
+            Style::default().fg(theme.gray),
+        )),
+        footer,
+    );
+    let cursor = state.query.text()[..state.query.cursor()].width() as u16;
+    frame.set_cursor_position((
+        search.x + 2 + cursor.min(search.width.saturating_sub(3)),
+        search.y,
+    ));
+}
+
+fn relative_time(timestamp: i64) -> String {
+    let seconds = (Utc::now().timestamp_millis() - timestamp).max(0) / 1_000;
+    match seconds {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => format!("{}m ago", seconds / 60),
+        3_600..=86_399 => format!("{}h ago", seconds / 3_600),
+        86_400..=604_799 => format!("{}d ago", seconds / 86_400),
+        _ => absolute_time(timestamp),
+    }
+}
+
+fn absolute_time(timestamp: i64) -> String {
+    Utc.timestamp_millis_opt(timestamp)
+        .single()
+        .map(|value| value.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| "Unknown".to_string())
 }
 
 fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, zones: &mut HitZones) {
@@ -416,12 +628,11 @@ fn build_transcript_rows(
             }
         }
         TranscriptEntry::Assistant { text, .. } => {
-            for segment in wrap_text(text, width.saturating_sub(2).max(1)) {
+            for line in markdown_lines(text, width.saturating_sub(2).max(1), theme) {
+                let mut spans = vec![Span::raw("  ")];
+                spans.extend(line.spans);
                 rows.push(TranscriptRow {
-                    line: Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(segment, Style::default().fg(theme.text_primary)),
-                    ]),
+                    line: Line::from(spans),
                     background: theme.bg_base,
                     fold_entry: None,
                 });
@@ -1443,6 +1654,373 @@ fn composer_height(text: &str, width: u16) -> u16 {
     rows.clamp(1, 5) + 2
 }
 
+fn markdown_lines(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let logical = text.lines().collect::<Vec<_>>();
+    let mut output = Vec::new();
+    let mut index = 0;
+    let mut code_block = false;
+    while index < logical.len() {
+        let source = logical[index];
+        let trimmed = source.trim();
+        if trimmed.starts_with("```") {
+            code_block = !code_block;
+            index += 1;
+            continue;
+        }
+        if code_block {
+            output.extend(wrap_styled_spans(
+                vec![Span::styled(
+                    source.to_string(),
+                    Style::default().fg(theme.command).bg(theme.bg_dark),
+                )],
+                width,
+            ));
+            index += 1;
+            continue;
+        }
+        if index + 1 < logical.len()
+            && source.contains('|')
+            && is_table_separator(logical[index + 1])
+        {
+            let mut table = vec![table_cells(source)];
+            index += 2;
+            while index < logical.len() && logical[index].contains('|') {
+                table.push(table_cells(logical[index]));
+                index += 1;
+            }
+            output.extend(render_markdown_table(&table, width, theme));
+            continue;
+        }
+        if trimmed.is_empty() {
+            output.push(Line::default());
+            index += 1;
+            continue;
+        }
+
+        let (prefix, body, style) = if let Some(body) = trimmed.strip_prefix('>') {
+            (
+                "│ ",
+                body.trim_start(),
+                Style::default()
+                    .fg(theme.text_secondary)
+                    .add_modifier(Modifier::ITALIC),
+            )
+        } else if let Some((level, body)) = markdown_heading(trimmed) {
+            let modifier = if level <= 2 {
+                Modifier::BOLD | Modifier::UNDERLINED
+            } else {
+                Modifier::BOLD
+            };
+            (
+                "",
+                body,
+                Style::default()
+                    .fg(theme.text_primary)
+                    .add_modifier(modifier),
+            )
+        } else if let Some(body) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("+ "))
+        {
+            ("• ", body, Style::default().fg(theme.text_primary))
+        } else if let Some((prefix, body)) = ordered_list_item(trimmed) {
+            (prefix, body, Style::default().fg(theme.text_primary))
+        } else if is_horizontal_rule(trimmed) {
+            output.push(Line::styled(
+                "─".repeat(width),
+                Style::default().fg(theme.gray_dim),
+            ));
+            index += 1;
+            continue;
+        } else {
+            ("", source, Style::default().fg(theme.text_primary))
+        };
+        let mut spans = Vec::new();
+        if !prefix.is_empty() {
+            spans.push(Span::styled(
+                prefix.to_string(),
+                Style::default().fg(if prefix == "│ " {
+                    theme.fuzzy_accent
+                } else {
+                    theme.gray_bright
+                }),
+            ));
+        }
+        spans.extend(parse_inline_markdown(body, style, theme));
+        output.extend(wrap_styled_spans(spans, width));
+        index += 1;
+    }
+    if output.is_empty() {
+        output.push(Line::default());
+    }
+    output
+}
+
+fn parse_inline_markdown(input: &str, style: Style, theme: &Theme) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut remaining = input;
+    while !remaining.is_empty() {
+        if let Some(rest) = remaining.strip_prefix('\\')
+            && let Some(character) = rest.chars().next()
+        {
+            spans.push(Span::styled(character.to_string(), style));
+            remaining = &rest[character.len_utf8()..];
+            continue;
+        }
+        let delimiter = [
+            ("***", Modifier::BOLD | Modifier::ITALIC),
+            ("___", Modifier::BOLD | Modifier::ITALIC),
+            ("**", Modifier::BOLD),
+            ("__", Modifier::BOLD),
+            ("~~", Modifier::CROSSED_OUT),
+            ("*", Modifier::ITALIC),
+            ("_", Modifier::ITALIC),
+        ]
+        .into_iter()
+        .find_map(|(delimiter, modifier)| {
+            let body = remaining.strip_prefix(delimiter)?;
+            let end = body.find(delimiter)?;
+            Some((
+                delimiter,
+                modifier,
+                &body[..end],
+                &body[end + delimiter.len()..],
+            ))
+        });
+        if let Some((_delimiter, modifier, body, rest)) = delimiter {
+            spans.extend(parse_inline_markdown(
+                body,
+                style.add_modifier(modifier),
+                theme,
+            ));
+            remaining = rest;
+            continue;
+        }
+        if let Some(body) = remaining.strip_prefix('`')
+            && let Some(end) = body.find('`')
+        {
+            spans.push(Span::styled(
+                body[..end].to_string(),
+                style.fg(theme.command).bg(theme.bg_dark),
+            ));
+            remaining = &body[end + 1..];
+            continue;
+        }
+        if let Some(label) = remaining.strip_prefix('[')
+            && let Some(label_end) = label.find("](")
+            && let Some(url_end) = label[label_end + 2..].find(')')
+        {
+            let url_start = label_end + 2;
+            let url_end = url_start + url_end;
+            spans.extend(parse_inline_markdown(
+                &label[..label_end],
+                style
+                    .fg(theme.fuzzy_accent)
+                    .add_modifier(Modifier::UNDERLINED),
+                theme,
+            ));
+            spans.push(Span::styled(
+                format!(" ({})", &label[url_start..url_end]),
+                Style::default().fg(theme.gray),
+            ));
+            remaining = &label[url_end + 1..];
+            continue;
+        }
+
+        let next = remaining
+            .char_indices()
+            .skip(1)
+            .find_map(|(index, character)| {
+                matches!(character, '\\' | '*' | '_' | '~' | '`' | '[').then_some(index)
+            })
+            .unwrap_or(remaining.len());
+        let next = if next == 0 {
+            remaining
+                .chars()
+                .next()
+                .map_or(remaining.len(), char::len_utf8)
+        } else {
+            next
+        };
+        spans.push(Span::styled(remaining[..next].to_string(), style));
+        remaining = &remaining[next..];
+    }
+    spans
+}
+
+fn wrap_styled_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut output = Vec::new();
+    let mut current = Vec::new();
+    let mut current_width = 0;
+    for span in spans {
+        let style = span.style;
+        for token in span.content.split_inclusive(char::is_whitespace) {
+            let mut token = token.to_string();
+            if current_width == 0 {
+                token = token.trim_start().to_string();
+            }
+            if token.is_empty() {
+                continue;
+            }
+            let token_width = token.width();
+            if current_width > 0 && current_width + token_width > width {
+                output.push(Line::from(std::mem::take(&mut current)));
+                current_width = 0;
+                token = token.trim_start().to_string();
+            }
+            if token.width() <= width {
+                current_width += token.width();
+                current.push(Span::styled(token, style));
+                continue;
+            }
+            let mut fragment = String::new();
+            for character in token.chars() {
+                let character_width = character.width().unwrap_or(0);
+                if current_width + fragment.width() + character_width > width {
+                    if !fragment.is_empty() {
+                        current.push(Span::styled(std::mem::take(&mut fragment), style));
+                    }
+                    output.push(Line::from(std::mem::take(&mut current)));
+                    current_width = 0;
+                }
+                fragment.push(character);
+            }
+            if !fragment.is_empty() {
+                current_width += fragment.width();
+                current.push(Span::styled(fragment, style));
+            }
+        }
+    }
+    if !current.is_empty() || output.is_empty() {
+        output.push(Line::from(current));
+    }
+    output
+}
+
+fn markdown_heading(line: &str) -> Option<(usize, &str)> {
+    let level = line
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
+    (level > 0 && level <= 6 && line.as_bytes().get(level) == Some(&b' '))
+        .then_some((level, line[level + 1..].trim()))
+}
+
+fn ordered_list_item(line: &str) -> Option<(&str, &str)> {
+    let end = line.find(". ")?;
+    line[..end]
+        .chars()
+        .all(|character| character.is_ascii_digit())
+        .then_some((&line[..end + 2], &line[end + 2..]))
+}
+
+fn is_horizontal_rule(line: &str) -> bool {
+    let compact = line.replace(' ', "");
+    compact.len() >= 3
+        && compact
+            .chars()
+            .all(|character| character == '-' || character == '*' || character == '_')
+}
+
+fn table_cells(line: &str) -> Vec<String> {
+    line.trim()
+        .trim_matches('|')
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect()
+}
+
+fn is_table_separator(line: &str) -> bool {
+    let cells = table_cells(line);
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let body = cell.trim_matches(':').trim();
+            body.len() >= 3 && body.chars().all(|character| character == '-')
+        })
+}
+
+fn render_markdown_table(rows: &[Vec<String>], width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if columns == 0 {
+        return Vec::new();
+    }
+    let overhead = columns.saturating_mul(3).saturating_add(1);
+    let available = width.saturating_sub(overhead).max(columns);
+    let mut widths = (0..columns)
+        .map(|column| {
+            rows.iter()
+                .filter_map(|row| row.get(column))
+                .map(|cell| markdown_plain_text(cell).width())
+                .max()
+                .unwrap_or(1)
+                .max(1)
+        })
+        .collect::<Vec<_>>();
+    if widths.iter().sum::<usize>() > available {
+        let each = available / columns;
+        let remainder = available % columns;
+        for (index, column) in widths.iter_mut().enumerate() {
+            *column = each + usize::from(index < remainder);
+        }
+    }
+    let border = |left: char, middle: char, right: char| {
+        let mut value = String::new();
+        value.push(left);
+        for (index, width) in widths.iter().enumerate() {
+            value.push_str(&"─".repeat(width + 2));
+            value.push(if index + 1 == widths.len() {
+                right
+            } else {
+                middle
+            });
+        }
+        Line::styled(value, Style::default().fg(theme.gray_dim))
+    };
+    let mut output = vec![border('┌', '┬', '┐')];
+    for (row_index, row) in rows.iter().enumerate() {
+        let mut spans = vec![Span::styled("│ ", Style::default().fg(theme.gray_dim))];
+        for (column, width) in widths.iter().copied().enumerate() {
+            let cell = row.get(column).map(String::as_str).unwrap_or_default();
+            let value = truncate(&markdown_plain_text(cell), width);
+            let padding = width.saturating_sub(value.width());
+            spans.push(Span::styled(
+                value,
+                Style::default()
+                    .fg(theme.text_primary)
+                    .add_modifier(if row_index == 0 {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ));
+            spans.push(Span::raw(" ".repeat(padding + 1)));
+            spans.push(Span::styled(
+                if column + 1 == columns { "│" } else { "│ " },
+                Style::default().fg(theme.gray_dim),
+            ));
+        }
+        output.push(Line::from(spans));
+        if row_index == 0 {
+            output.push(border('├', '┼', '┤'));
+        }
+    }
+    output.push(border('└', '┴', '┘'));
+    output
+}
+
+fn markdown_plain_text(value: &str) -> String {
+    parse_inline_markdown(
+        value,
+        Style::default(),
+        &Theme::for_preference(crate::theme::ThemeKind::IndusNight),
+    )
+    .into_iter()
+    .map(|span| span.content.into_owned())
+    .collect()
+}
+
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if text.is_empty() {
         return vec![String::new()];
@@ -1586,6 +2164,54 @@ mod tests {
     #[test]
     fn slash_dropdown_stays_at_six_visible_rows() {
         assert_eq!(MAX_SLASH_ROWS, 6);
+    }
+
+    #[test]
+    fn assistant_markdown_applies_emphasis_links_and_quotes() {
+        let theme = Theme::for_preference(crate::theme::ThemeKind::IndusNight);
+        let lines = markdown_lines(
+            "**bold** *italic* ***both*** [Indus](https://mciair.in)\n> quoted",
+            100,
+            &theme,
+        );
+        let spans = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .collect::<Vec<_>>();
+        assert!(spans.iter().any(|span| {
+            span.content == "bold" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        assert!(spans.iter().any(|span| {
+            span.content == "italic" && span.style.add_modifier.contains(Modifier::ITALIC)
+        }));
+        assert!(spans.iter().any(|span| {
+            span.content == "both"
+                && span.style.add_modifier.contains(Modifier::BOLD)
+                && span.style.add_modifier.contains(Modifier::ITALIC)
+        }));
+        assert!(spans.iter().any(|span| {
+            span.content == "Indus" && span.style.add_modifier.contains(Modifier::UNDERLINED)
+        }));
+        assert!(
+            lines
+                .iter()
+                .any(|line| plain_line(line).starts_with("│ quoted"))
+        );
+    }
+
+    #[test]
+    fn assistant_markdown_renders_tables_with_terminal_borders() {
+        let theme = Theme::for_preference(crate::theme::ThemeKind::IndusNight);
+        let lines = markdown_lines(
+            "| Name | State |\n| --- | --- |\n| Indus | Ready |",
+            60,
+            &theme,
+        );
+        let rendered = lines.iter().map(plain_line).collect::<Vec<_>>().join("\n");
+        assert!(rendered.contains('┌'));
+        assert!(rendered.contains("Indus"));
+        assert!(rendered.contains("Ready"));
+        assert!(rendered.contains('└'));
     }
 
     #[test]
