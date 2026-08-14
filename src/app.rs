@@ -9,7 +9,11 @@ use ratatui::layout::Rect;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    harness::event::{FileDiff, HarnessEvent, PermissionReply, RunOutcome},
+    harness::{
+        SessionSummary,
+        event::{FileDiff, HarnessEvent, PermissionReply, RunOutcome},
+        session::{AssistantPart, Session, SessionMessage, ToolState},
+    },
     provider::{
         DiscoveryErrorKind, ModelDiscovery, ModelRecord, ModelSelection, ProviderId, ProviderStore,
     },
@@ -62,6 +66,7 @@ pub struct HitZones {
     pub slash_rows: Vec<(Rect, usize)>,
     pub fold_rows: Vec<(Rect, usize)>,
     pub catalog_rows: Vec<(Rect, usize)>,
+    pub resume_rows: Vec<(Rect, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -104,7 +109,6 @@ impl Composer {
         self.text.is_empty()
     }
 
-    #[cfg(test)]
     pub fn set(&mut self, value: impl Into<String>) {
         self.text = value.into();
         self.cursor = self.text.len();
@@ -302,6 +306,39 @@ pub enum CatalogModal {
     },
 }
 
+#[derive(Clone, Debug)]
+pub struct ResumePanel {
+    pub sessions: Vec<SessionSummary>,
+    pub query: Composer,
+    pub selected: usize,
+    pub expanded: bool,
+}
+
+impl ResumePanel {
+    pub fn visible_sessions(&self) -> Vec<&SessionSummary> {
+        let query = self.query.text().trim().to_lowercase();
+        self.sessions
+            .iter()
+            .filter(|session| {
+                query.is_empty()
+                    || session.title.to_lowercase().contains(&query)
+                    || session.id.to_lowercase().contains(&query)
+                    || session.directory.to_lowercase().contains(&query)
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionCommand {
+    OpenResume,
+    Resume(String),
+    New,
+    EditPrompt,
+    Copy(String),
+    Rename(String),
+}
+
 pub struct App {
     pub cwd: PathBuf,
     pub composer: Composer,
@@ -314,6 +351,9 @@ pub struct App {
     pub turn: Option<ActiveTurn>,
     pub permission: Option<PermissionPrompt>,
     pub catalog_modal: Option<CatalogModal>,
+    pub resume_panel: Option<ResumePanel>,
+    pub session_id: Option<String>,
+    pub session_title: Option<String>,
     pub animation_tick: u64,
     pub running: bool,
     pub hit_zones: HitZones,
@@ -325,6 +365,7 @@ pub struct App {
     selection_autoscroll: i8,
     pending_submission: Option<String>,
     pending_permission_reply: Option<(u64, PermissionReply)>,
+    pending_session_command: Option<SessionCommand>,
     thinking_entries: HashMap<String, (usize, Instant)>,
     assistant_entries: HashMap<String, usize>,
     tool_entries: HashMap<String, (usize, Instant)>,
@@ -353,6 +394,9 @@ impl App {
             turn: None,
             permission: None,
             catalog_modal: None,
+            resume_panel: None,
+            session_id: None,
+            session_title: None,
             animation_tick: 0,
             running: true,
             hit_zones: HitZones::default(),
@@ -364,6 +408,7 @@ impl App {
             selection_autoscroll: 0,
             pending_submission: None,
             pending_permission_reply: None,
+            pending_session_command: None,
             thinking_entries: HashMap::new(),
             assistant_entries: HashMap::new(),
             tool_entries: HashMap::new(),
@@ -899,6 +944,197 @@ impl App {
         self.pending_permission_reply.take()
     }
 
+    pub fn take_session_command(&mut self) -> Option<SessionCommand> {
+        self.pending_session_command.take()
+    }
+
+    pub fn open_resume_panel(&mut self, sessions: Vec<SessionSummary>) {
+        self.close_slash();
+        self.catalog_modal = None;
+        self.resume_panel = Some(ResumePanel {
+            sessions,
+            query: Composer::default(),
+            selected: 0,
+            expanded: false,
+        });
+    }
+
+    pub fn close_resume_panel(&mut self) {
+        self.resume_panel = None;
+    }
+
+    pub fn edit_resume_query(&mut self, edit: impl FnOnce(&mut Composer)) {
+        let Some(panel) = self.resume_panel.as_mut() else {
+            return;
+        };
+        edit(&mut panel.query);
+        panel.selected = 0;
+        panel.expanded = false;
+    }
+
+    pub fn move_resume_selection(&mut self, delta: isize) {
+        let Some(panel) = self.resume_panel.as_mut() else {
+            return;
+        };
+        let query = panel.query.text().trim().to_lowercase();
+        let count = panel
+            .sessions
+            .iter()
+            .filter(|session| {
+                query.is_empty()
+                    || session.title.to_lowercase().contains(&query)
+                    || session.id.to_lowercase().contains(&query)
+                    || session.directory.to_lowercase().contains(&query)
+            })
+            .count();
+        if count > 0 {
+            panel.selected = (panel.selected as isize + delta).rem_euclid(count as isize) as usize;
+            panel.expanded = false;
+        }
+    }
+
+    pub fn select_resume_index(&mut self, index: usize) {
+        if let Some(panel) = self.resume_panel.as_mut()
+            && index < panel.visible_sessions().len()
+        {
+            panel.selected = index;
+        }
+    }
+
+    pub fn toggle_resume_details(&mut self) {
+        if let Some(panel) = self.resume_panel.as_mut()
+            && !panel.visible_sessions().is_empty()
+        {
+            panel.expanded = !panel.expanded;
+        }
+    }
+
+    pub fn submit_resume_selection(&mut self) {
+        let Some(panel) = self.resume_panel.as_ref() else {
+            return;
+        };
+        let Some(session_id) = panel
+            .visible_sessions()
+            .get(panel.selected)
+            .map(|session| session.id.clone())
+        else {
+            return;
+        };
+        self.resume_panel = None;
+        self.pending_session_command = Some(SessionCommand::Resume(session_id));
+    }
+
+    pub fn load_session(&mut self, session: &Session) {
+        self.transcript.clear();
+        self.thinking_entries.clear();
+        self.assistant_entries.clear();
+        self.tool_entries.clear();
+        self.turn = None;
+        self.permission = None;
+        self.composer.clear();
+        self.close_slash();
+        self.resume_panel = None;
+        self.session_id = session.is_allocated().then(|| session.id.clone());
+        self.session_title = session.title.clone();
+        for message in &session.messages {
+            match message {
+                SessionMessage::User(message) => self.transcript.push(TranscriptEntry::User {
+                    text: message.text.clone(),
+                    slash_tokens: recognized_slash_tokens(&message.text),
+                }),
+                SessionMessage::Assistant(message) => {
+                    for part in &message.parts {
+                        match part {
+                            AssistantPart::Reasoning(part) if !part.text.is_empty() => {
+                                self.transcript.push(TranscriptEntry::Thinking {
+                                    id: part.id.clone(),
+                                    text: part.text.clone(),
+                                    running: !part.completed,
+                                    elapsed_ms: None,
+                                    expanded: !part.completed,
+                                });
+                            }
+                            AssistantPart::Text(part) if !part.text.is_empty() => {
+                                self.transcript.push(TranscriptEntry::Assistant {
+                                    id: part.id.clone(),
+                                    text: part.text.clone(),
+                                    streaming: !part.completed,
+                                });
+                            }
+                            AssistantPart::Tool(part) => {
+                                let (description, output, state, diffs, expanded) =
+                                    match &part.state {
+                                        ToolState::Pending | ToolState::Running => (
+                                            part.name.clone(),
+                                            String::new(),
+                                            ToolVisualState::Running,
+                                            Vec::new(),
+                                            false,
+                                        ),
+                                        ToolState::Completed {
+                                            title,
+                                            output,
+                                            diffs,
+                                        } => (
+                                            title.clone(),
+                                            output.clone(),
+                                            ToolVisualState::Succeeded,
+                                            diffs.clone(),
+                                            false,
+                                        ),
+                                        ToolState::Failed { message } => (
+                                            part.name.clone(),
+                                            String::new(),
+                                            ToolVisualState::Failed(message.clone()),
+                                            Vec::new(),
+                                            true,
+                                        ),
+                                    };
+                                self.transcript.push(TranscriptEntry::Tool {
+                                    call_id: part.call_id.clone(),
+                                    name: part.name.clone(),
+                                    description,
+                                    input: part.input.clone(),
+                                    output,
+                                    state,
+                                    elapsed_ms: None,
+                                    expanded,
+                                    diffs,
+                                });
+                            }
+                            AssistantPart::Reasoning(_) | AssistantPart::Text(_) => {}
+                        }
+                    }
+                }
+            }
+        }
+        self.transcript_follow = true;
+        self.transcript_scroll = 0;
+    }
+
+    pub fn report_session_error(&mut self, message: impl Into<String>) {
+        self.transcript.push(TranscriptEntry::Event(message.into()));
+    }
+
+    pub fn restore_edited_prompt(&mut self, session: &Session, prompt: String) {
+        self.load_session(session);
+        self.composer.set(prompt);
+        self.refresh_slash();
+    }
+
+    pub fn set_session_title(&mut self, title: String) {
+        self.session_title = Some(title);
+    }
+
+    pub fn last_response(&self) -> Option<String> {
+        self.transcript.iter().rev().find_map(|entry| match entry {
+            TranscriptEntry::Assistant { text, .. } if !text.trim().is_empty() => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+    }
+
     pub fn resolve_permission(&mut self, reply: PermissionReply) -> bool {
         let Some(prompt) = self.permission.take() else {
             return false;
@@ -915,9 +1151,7 @@ impl App {
             MenuAction::Changelog => self
                 .transcript
                 .push(TranscriptEntry::Event("Changelog".to_string())),
-            MenuAction::Resume => self
-                .transcript
-                .push(TranscriptEntry::Event("Resume Session".to_string())),
+            MenuAction::Resume => self.pending_session_command = Some(SessionCommand::OpenResume),
             MenuAction::Worktree => self
                 .transcript
                 .push(TranscriptEntry::Event("New Worktree".to_string())),
@@ -927,6 +1161,12 @@ impl App {
 
     pub fn apply_harness_event(&mut self, event: HarnessEvent) {
         match event {
+            HarnessEvent::SessionCreated {
+                session_id, title, ..
+            } => {
+                self.session_id = Some(session_id);
+                self.session_title = Some(title);
+            }
             HarnessEvent::RunStarted { run_id } => {
                 if let Some(turn) = self.turn.as_mut() {
                     turn.run_id = Some(run_id);
@@ -1270,6 +1510,21 @@ impl App {
 
         match command.name {
             "quit" => self.running = false,
+            "new" => self.pending_session_command = Some(SessionCommand::New),
+            "resume" => self.pending_session_command = Some(SessionCommand::OpenResume),
+            "edit-prompt" => self.pending_session_command = Some(SessionCommand::EditPrompt),
+            "copy" => {
+                if let Some(response) = self.last_response() {
+                    self.pending_session_command = Some(SessionCommand::Copy(response));
+                } else {
+                    self.transcript.push(TranscriptEntry::Event(
+                        "There is no response to copy.".to_string(),
+                    ));
+                }
+            }
+            "rename" => {
+                self.pending_session_command = Some(SessionCommand::Rename(args.to_string()))
+            }
             "home" => {
                 self.transcript.clear();
                 self.turn = None;
@@ -1453,6 +1708,41 @@ mod tests {
         assert!(app.accept_slash_completion());
         assert_eq!(app.composer.text(), "/theme ");
         assert!(matches!(app.slash.phase, CompletionPhase::Arguments { .. }));
+    }
+
+    #[test]
+    fn session_commands_dispatch_real_actions() {
+        let mut app = App::new();
+        app.transcript.push(TranscriptEntry::Assistant {
+            id: "answer".into(),
+            text: "copy this".into(),
+            streaming: false,
+        });
+        app.composer.set("/copy");
+        app.submit();
+        assert_eq!(
+            app.take_session_command(),
+            Some(SessionCommand::Copy("copy this".into()))
+        );
+
+        app.composer.set("/rename Focused Session");
+        app.submit();
+        assert_eq!(
+            app.take_session_command(),
+            Some(SessionCommand::Rename("Focused Session".into()))
+        );
+
+        app.composer.set("/edit-prompt");
+        app.submit();
+        assert_eq!(app.take_session_command(), Some(SessionCommand::EditPrompt));
+
+        app.composer.set("/resume");
+        app.submit();
+        assert_eq!(app.take_session_command(), Some(SessionCommand::OpenResume));
+
+        app.composer.set("/new");
+        app.submit();
+        assert_eq!(app.take_session_command(), Some(SessionCommand::New));
     }
 
     #[test]
