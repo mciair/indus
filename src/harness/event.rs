@@ -138,6 +138,12 @@ pub enum HarnessEvent {
         delay_ms: u64,
         message: String,
     },
+    CompactionStarted {
+        run_id: u64,
+    },
+    CompactionFinished {
+        run_id: u64,
+    },
     CompactionRequired {
         run_id: u64,
     },
