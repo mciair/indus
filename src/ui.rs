@@ -80,7 +80,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_slash_dropdown(frame, prompt, app, &theme, &mut zones);
     }
     if app.catalog_modal.is_some() {
-        render_catalog_modal(frame, app, &theme, &mut zones);
+        render_catalog_modal(frame, prompt, app, &theme, &mut zones);
     }
     app.hit_zones = zones;
 }
@@ -836,210 +836,160 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
     }
 }
 
-fn render_catalog_modal(frame: &mut Frame<'_>, app: &App, theme: &Theme, zones: &mut HitZones) {
-    let area = frame.area();
+fn render_catalog_modal(
+    frame: &mut Frame<'_>,
+    prompt: Rect,
+    app: &App,
+    theme: &Theme,
+    zones: &mut HitZones,
+) {
     match app.catalog_modal.as_ref() {
         Some(CatalogModal::Providers { selected }) => {
-            render_provider_catalog(frame, area, *selected, theme, zones)
+            render_provider_catalog(frame, prompt, *selected, theme, zones)
         }
         Some(CatalogModal::Models(view)) => {
-            render_model_catalog(frame, area, view, app.animation_tick, theme, zones)
+            render_model_catalog(frame, prompt, view, app.animation_tick, theme, zones)
         }
         Some(CatalogModal::ApiKey {
             provider,
             input,
             error,
-        }) => render_api_key_popover(frame, area, *provider, input, error.as_deref(), theme),
+        }) => render_api_key_popover(
+            frame,
+            frame.area(),
+            *provider,
+            input,
+            error.as_deref(),
+            theme,
+        ),
         None => {}
     }
 }
 
 fn render_provider_catalog(
     frame: &mut Frame<'_>,
-    area: Rect,
+    prompt: Rect,
     selected: usize,
     theme: &Theme,
     zones: &mut HitZones,
 ) {
-    let width = area.width.saturating_sub(6).min(92).max(44);
-    let height = 11u16.min(area.height.saturating_sub(2)).max(8);
-    let panel = centered_rect(area, width.min(area.width), height.min(area.height));
-    render_popover_surface(frame, panel, theme);
-    render_popover_header(frame, panel, "Model Provider", theme);
-
-    let subtitle = Rect::new(panel.x + 3, panel.y + 2, panel.width.saturating_sub(6), 1);
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            "Select a provider to open its model catalog",
-            Style::default().fg(theme.gray),
-        )),
-        subtitle,
-    );
-
-    let rows_x = panel.x + 3;
-    let rows_width = panel.width.saturating_sub(6);
+    let Some(panel) = render_slash_panel(
+        frame,
+        prompt,
+        ProviderId::ALL.len(),
+        ProviderId::ALL.len(),
+        theme,
+    ) else {
+        return;
+    };
     for (index, provider) in ProviderId::ALL.iter().enumerate() {
-        let row = Rect::new(rows_x, panel.y + 3 + index as u16, rows_width, 1);
-        let selected = index == selected;
-        let background = if selected {
-            theme.bg_visual
-        } else {
-            theme.bg_light
-        };
-        fill(frame.buffer_mut(), row, Style::default().bg(background));
-        let name = provider.name();
-        let label = "Compatible Interim Provider";
-        let gap = row
-            .width
-            .saturating_sub(name.width() as u16 + label.width() as u16 + 2);
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    if selected { "› " } else { "  " },
-                    Style::default().fg(theme.accent_skill).bg(background),
-                ),
-                Span::styled(
-                    name,
-                    Style::default()
-                        .fg(theme.text_primary)
-                        .bg(background)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" ".repeat(gap as usize), Style::default().bg(background)),
-                Span::styled(label, Style::default().fg(theme.gray_bright).bg(background)),
-            ])),
-            row,
+        let row = render_catalog_row(
+            frame,
+            panel,
+            index,
+            index == selected,
+            provider.name(),
+            "Compatible Interim Provider",
+            theme,
         );
         zones.catalog_rows.push((row, index));
     }
-
-    render_popover_footer(frame, panel, "enter open    ↑↓ navigate", theme);
 }
 
 fn render_model_catalog(
     frame: &mut Frame<'_>,
-    area: Rect,
+    prompt: Rect,
     view: &ModelCatalogView,
     animation_tick: u64,
     theme: &Theme,
     zones: &mut HitZones,
 ) {
-    let width = area.width.saturating_sub(6).min(96).max(48);
-    let height = area.height.saturating_sub(4).clamp(10, 18);
-    let panel = centered_rect(area, width.min(area.width), height.min(area.height));
-    render_popover_surface(frame, panel, theme);
-    render_popover_header(
-        frame,
-        panel,
-        &format!("{} Models", view.provider.name()),
-        theme,
-    );
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            view.provider.base_url(),
-            Style::default().fg(theme.gray),
-        )),
-        Rect::new(panel.x + 3, panel.y + 2, panel.width.saturating_sub(6), 1),
-    );
-
-    let rows_height = panel.height.saturating_sub(6) as usize;
-    let start = if view.selected >= rows_height {
-        view.selected + 1 - rows_height
+    let status = if view.models.is_empty() {
+        if view.loading {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let spinner = frames[(animation_tick as usize / 2) % frames.len()];
+            Some((
+                format!("{spinner} Fetching {} models…", view.provider.name()),
+                view.provider.base_url().to_string(),
+                theme.text_secondary,
+            ))
+        } else if let Some(error) = &view.error {
+            Some((
+                "Model discovery failed".to_string(),
+                error.clone(),
+                theme.accent_error,
+            ))
+        } else {
+            Some((
+                "No compatible models".to_string(),
+                view.provider.base_url().to_string(),
+                theme.gray,
+            ))
+        }
     } else {
-        0
+        None
     };
+    let shown = if status.is_some() {
+        1
+    } else {
+        view.models.len().min(MAX_SLASH_ROWS)
+    };
+    let Some(panel) = render_slash_panel(frame, prompt, view.models.len(), shown, theme) else {
+        return;
+    };
+
+    if let Some((label, description, color)) = status {
+        let row = Rect::new(panel.x + 1, panel.y + 1, panel.width.saturating_sub(1), 1);
+        fill(frame.buffer_mut(), row, Style::default().bg(theme.bg_light));
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("  ", Style::default().bg(theme.bg_light)),
+                Span::styled(label, Style::default().fg(color).bg(theme.bg_light)),
+                Span::styled("  ", Style::default().bg(theme.bg_light)),
+                Span::styled(
+                    truncate(&description, row.width.saturating_sub(28) as usize),
+                    Style::default().fg(theme.gray).bg(theme.bg_light),
+                ),
+            ])),
+            row,
+        );
+        return;
+    }
+
+    let start = view
+        .selected
+        .saturating_add(1)
+        .saturating_sub(MAX_SLASH_ROWS);
     for (offset, (index, model)) in view
         .models
         .iter()
         .enumerate()
         .skip(start)
-        .take(rows_height)
+        .take(MAX_SLASH_ROWS)
         .enumerate()
     {
-        let row = Rect::new(
-            panel.x + 3,
-            panel.y + 3 + offset as u16,
-            panel.width.saturating_sub(6),
-            1,
-        );
-        let selected = index == view.selected;
-        let background = if selected {
-            theme.bg_visual
-        } else {
-            theme.bg_light
-        };
-        fill(frame.buffer_mut(), row, Style::default().bg(background));
-        let suffix = model
+        let context = model
             .context_window
             .map(format_context_window)
             .unwrap_or_default();
-        let available = row.width.saturating_sub(suffix.width() as u16 + 4).max(1) as usize;
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    if selected { "› " } else { "  " },
-                    Style::default().fg(theme.accent_skill).bg(background),
-                ),
-                Span::styled(
-                    truncate(&model.name, available),
-                    Style::default()
-                        .fg(theme.text_primary)
-                        .bg(background)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    " ".repeat(row.width.saturating_sub(
-                        truncate(&model.name, available).width() as u16 + suffix.width() as u16 + 2,
-                    ) as usize),
-                    Style::default().bg(background),
-                ),
-                Span::styled(suffix, Style::default().fg(theme.gray).bg(background)),
-            ])),
-            row,
+        let description = if model.name == model.id {
+            context
+        } else if context.is_empty() {
+            model.id.clone()
+        } else {
+            format!("{} · {context}", model.id)
+        };
+        let row = render_catalog_row(
+            frame,
+            panel,
+            offset,
+            index == view.selected,
+            &model.name,
+            &description,
+            theme,
         );
         zones.catalog_rows.push((row, index));
     }
-
-    let message_area = Rect::new(
-        panel.x + 3,
-        panel.bottom().saturating_sub(3),
-        panel.width.saturating_sub(6),
-        1,
-    );
-    if view.loading {
-        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let spinner = frames[(animation_tick as usize / 2) % frames.len()];
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                format!("{spinner} Fetching available models…"),
-                Style::default().fg(theme.text_secondary),
-            )),
-            message_area,
-        );
-    } else if let Some(error) = &view.error {
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                truncate(error, message_area.width as usize),
-                Style::default().fg(theme.accent_error),
-            )),
-            message_area,
-        );
-    } else if view.models.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                "No compatible models were returned.",
-                Style::default().fg(theme.gray),
-            )),
-            message_area,
-        );
-    }
-
-    render_popover_footer(
-        frame,
-        panel,
-        "enter select    ↑↓ navigate    r refresh    k API key",
-        theme,
-    );
 }
 
 fn render_api_key_popover(
@@ -1204,39 +1154,9 @@ fn render_slash_dropdown(
     if shown == 0 {
         return;
     }
-    let height = shown as u16 + 2;
-    if prompt.y < height {
+    let Some(panel) = render_slash_panel(frame, prompt, count, shown, theme) else {
         return;
-    }
-    let panel = Rect::new(prompt.x, prompt.y - height, prompt.width, height);
-    frame.render_widget(Clear, panel);
-    fill(
-        frame.buffer_mut(),
-        panel,
-        Style::default().bg(theme.bg_light),
-    );
-    let border_style = Style::default().fg(theme.bg_visual).bg(theme.bg_base);
-    frame.render_widget(
-        Paragraph::new(Line::styled("─".repeat(panel.width as usize), border_style)),
-        Rect::new(panel.x, panel.y, panel.width, 1),
-    );
-    frame.render_widget(
-        Paragraph::new(Line::styled("─".repeat(panel.width as usize), border_style)),
-        Rect::new(panel.x, panel.bottom() - 1, panel.width, 1),
-    );
-    let count_text = count.to_string();
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            count_text.clone(),
-            Style::default().fg(theme.gray).bg(theme.bg_base),
-        )),
-        Rect::new(
-            panel.right().saturating_sub(count_text.width() as u16 + 1),
-            panel.y,
-            count_text.width() as u16,
-            1,
-        ),
-    );
+    };
 
     let row_width = panel.width.saturating_sub(2) as usize;
     let label_width = (row_width * 3 / 5).min(40);
@@ -1286,6 +1206,106 @@ fn render_slash_dropdown(
         frame.render_widget(Paragraph::new(Line::from(spans)), row);
         zones.slash_rows.push((row, index));
     }
+}
+
+fn render_slash_panel(
+    frame: &mut Frame<'_>,
+    prompt: Rect,
+    count: usize,
+    shown: usize,
+    theme: &Theme,
+) -> Option<Rect> {
+    if shown == 0 {
+        return None;
+    }
+    let height = shown as u16 + 2;
+    if prompt.y < height {
+        return None;
+    }
+    let panel = Rect::new(prompt.x, prompt.y - height, prompt.width, height);
+    frame.render_widget(Clear, panel);
+    fill(
+        frame.buffer_mut(),
+        panel,
+        Style::default().bg(theme.bg_light),
+    );
+    let border_style = Style::default().fg(theme.bg_visual).bg(theme.bg_base);
+    frame.render_widget(
+        Paragraph::new(Line::styled("─".repeat(panel.width as usize), border_style)),
+        Rect::new(panel.x, panel.y, panel.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled("─".repeat(panel.width as usize), border_style)),
+        Rect::new(panel.x, panel.bottom() - 1, panel.width, 1),
+    );
+    let count_text = count.to_string();
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            count_text.clone(),
+            Style::default().fg(theme.gray).bg(theme.bg_base),
+        )),
+        Rect::new(
+            panel.right().saturating_sub(count_text.width() as u16 + 1),
+            panel.y,
+            count_text.width() as u16,
+            1,
+        ),
+    );
+    Some(panel)
+}
+
+fn render_catalog_row(
+    frame: &mut Frame<'_>,
+    panel: Rect,
+    visible: usize,
+    selected: bool,
+    label: &str,
+    description: &str,
+    theme: &Theme,
+) -> Rect {
+    let row = Rect::new(
+        panel.x + 1,
+        panel.y + 1 + visible as u16,
+        panel.width.saturating_sub(1),
+        1,
+    );
+    let background = if selected {
+        theme.bg_visual
+    } else {
+        theme.bg_light
+    };
+    fill(frame.buffer_mut(), row, Style::default().bg(background));
+    let row_width = panel.width.saturating_sub(2) as usize;
+    let label_width = (row_width * 3 / 5).min(40);
+    let label = truncate(label, label_width);
+    let padding = label_width.saturating_sub(label.width()) + 2;
+    let description_width = row_width.saturating_sub(2 + label_width + 2);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                if selected { "❯ " } else { "  " },
+                Style::default().fg(theme.text_primary).bg(background),
+            ),
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(theme.text_primary)
+                    .bg(background)
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(" ".repeat(padding), Style::default().bg(background)),
+            Span::styled(
+                truncate(description, description_width),
+                Style::default().fg(theme.gray).bg(background),
+            ),
+        ])),
+        row,
+    );
+    row
 }
 
 fn highlighted_label(
