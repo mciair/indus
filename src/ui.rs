@@ -682,13 +682,14 @@ fn render_turn_status(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Them
     let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let spinner = frames[(app.animation_tick as usize / 2) % frames.len()];
     let activity_color = match turn.activity {
-        TurnActivity::RunningTool(_) => theme.accent_success,
+        TurnActivity::RunningTool(_) | TurnActivity::RunningJob(_) => theme.accent_success,
         TurnActivity::Retrying(_) => theme.warning,
         TurnActivity::Cancelling => theme.accent_error,
         TurnActivity::WaitingForPermission => theme.warning,
-        TurnActivity::Thinking | TurnActivity::Responding | TurnActivity::WaitingForResponse => {
-            theme.text_secondary
-        }
+        TurnActivity::Classifying
+        | TurnActivity::Thinking
+        | TurnActivity::Responding
+        | TurnActivity::WaitingForResponse => theme.text_secondary,
     };
     let label = turn.activity.label();
     frame.render_widget(
