@@ -42,6 +42,11 @@ pub struct FileDiff {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HarnessEvent {
+    SessionCreated {
+        run_id: u64,
+        session_id: String,
+        title: String,
+    },
     RunStarted {
         run_id: u64,
     },
