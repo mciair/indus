@@ -61,7 +61,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand::new("delete", "Delete the current session", "/delete"),
     SlashCommand::new("new", "Start a new session", "/new"),
     SlashCommand::new("fork", "Fork the current session", "/fork"),
-    SlashCommand::new("compact", "Compact conversation context", "/compact [instructions]"),
+    SlashCommand::new(
+        "compact",
+        "Compact conversation context",
+        "/compact [instructions]",
+    ),
     SlashCommand::new("copy", "Copy the last response", "/copy"),
     SlashCommand::new("find", "Search scrollback", "/find <query>"),
     SlashCommand::new("history", "Open prompt history", "/history"),
@@ -72,7 +76,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand::new("context", "Show loaded project context", "/context"),
     SlashCommand::new("model", "Change the active model", "/model"),
     SlashCommand::new("effort", "Set reasoning effort", "/effort"),
-    SlashCommand::new("always-approve", "Toggle approval behavior", "/always-approve"),
+    SlashCommand::new(
+        "always-approve",
+        "Toggle approval behavior",
+        "/always-approve",
+    ),
     SlashCommand::new("auto", "Toggle autonomous execution", "/auto"),
     SlashCommand::new("multiline", "Toggle multiline input", "/multiline"),
     SlashCommand::new("compact-mode", "Toggle compact UI mode", "/compact-mode"),
@@ -84,7 +92,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand::new("cd", "Change working directory", "/cd <path>"),
     SlashCommand::new("theme", "Change terminal theme", "/theme"),
     SlashCommand::new("feedback", "Send product feedback", "/feedback [message]"),
-    SlashCommand::new("announcements", "Show product announcements", "/announcements"),
+    SlashCommand::new(
+        "announcements",
+        "Show product announcements",
+        "/announcements",
+    ),
     SlashCommand::new("remember", "Store a project memory", "/remember <note>"),
     SlashCommand::new("plan", "Enter planning mode", "/plan"),
     SlashCommand::new("view-plan", "View the current plan", "/view-plan"),
@@ -109,7 +121,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand::new("tasks", "Show background tasks", "/tasks"),
     SlashCommand::new("release-notes", "Show release notes", "/release-notes"),
     SlashCommand::new("tutorial", "Open the interactive tutorial", "/tutorial"),
-    SlashCommand::new("config-agents", "Configure project agents", "/config-agents"),
+    SlashCommand::new(
+        "config-agents",
+        "Configure project agents",
+        "/config-agents",
+    ),
     SlashCommand::new("personas", "Manage personas", "/personas"),
 ];
 
@@ -205,7 +221,10 @@ impl App {
             .filter(|cmd| {
                 query.is_empty()
                     || cmd.name.contains(query)
-                    || cmd.description.to_lowercase().contains(&query.to_lowercase())
+                    || cmd
+                        .description
+                        .to_lowercase()
+                        .contains(&query.to_lowercase())
             })
             .collect()
     }
@@ -262,10 +281,12 @@ impl App {
                 self.status = "Changelog selected. Release notes wiring comes next.".to_string();
             }
             MenuAction::Resume => {
-                self.status = "Resume Session selected. Session loader wiring comes next.".to_string();
+                self.status =
+                    "Resume Session selected. Session loader wiring comes next.".to_string();
             }
             MenuAction::Worktree => {
-                self.status = "New Worktree selected. Worktree creation wiring comes next.".to_string();
+                self.status =
+                    "New Worktree selected. Worktree creation wiring comes next.".to_string();
             }
             MenuAction::Quit => self.running = false,
         }
@@ -275,7 +296,9 @@ impl App {
         let result = if cfg!(target_os = "macos") {
             Command::new("open").arg(ALPHA_URL).status()
         } else if cfg!(target_os = "windows") {
-            Command::new("cmd").args(["/C", "start", ALPHA_URL]).status()
+            Command::new("cmd")
+                .args(["/C", "start", ALPHA_URL])
+                .status()
         } else {
             Command::new("xdg-open").arg(ALPHA_URL).status()
         };
@@ -353,7 +376,10 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             }
         }
         KeyCode::Enter => {
-            if app.slash_open() && !app.slash_matches().is_empty() && app.input.split_whitespace().count() == 1 {
+            if app.slash_open()
+                && !app.slash_matches().is_empty()
+                && app.input.split_whitespace().count() == 1
+            {
                 app.select_slash();
             } else {
                 app.submit_input();
@@ -447,7 +473,10 @@ fn render_top_bar(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     let branch = current_branch().unwrap_or_else(|| "no git branch".to_string());
     let left = Line::from(vec![
         Span::styled(" ", Style::default().fg(theme.muted)),
-        Span::styled(branch, Style::default().fg(theme.text).add_modifier(Modifier::DIM)),
+        Span::styled(
+            branch,
+            Style::default().fg(theme.text).add_modifier(Modifier::DIM),
+        ),
         Span::raw("  "),
         Span::styled(collapse_home(&app.cwd), Style::default().fg(theme.dim)),
     ]);
@@ -470,15 +499,13 @@ fn render_top_bar(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     }
 }
 
-fn render_home(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &App,
-    theme: &Theme,
-    zones: &mut HitZones,
-) {
+fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, zones: &mut HitZones) {
     let min_box_width = 72;
-    let box_width = area.width.saturating_sub(8).min(112).max(min_box_width.min(area.width));
+    let box_width = area
+        .width
+        .saturating_sub(8)
+        .min(112)
+        .max(min_box_width.min(area.width));
     let box_height = 14u16.min(area.height.saturating_sub(2)).max(10);
     let [_, box_area, _] = Layout::vertical([
         Constraint::Min(0),
@@ -516,7 +543,12 @@ fn render_home(
     .areas(inner);
 
     let title_line = Line::from(vec![
-        Span::styled(PRODUCT, Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            PRODUCT,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("  ", Style::default()),
         Span::styled("India's AI-native CLI", Style::default().fg(theme.text)),
         Span::styled(format!("  v{VERSION}"), Style::default().fg(theme.muted)),
@@ -525,7 +557,10 @@ fn render_home(
 
     let cta_text = format!("[{ALPHA_LABEL}]");
     let cta_line = Line::from(vec![
-        Span::styled(cta_text.clone(), Style::default().fg(theme.link).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            cta_text.clone(),
+            Style::default().fg(theme.link).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("  ", Style::default()),
         Span::styled(ALPHA_URL, Style::default().fg(theme.muted)),
         Span::styled("  press u", Style::default().fg(theme.dim)),
@@ -567,7 +602,11 @@ fn render_menu_rows(
         };
         rows.push((row, item.action));
         let selected = app.selected_menu == idx;
-        let bg = if selected { theme.highlight } else { theme.panel };
+        let bg = if selected {
+            theme.highlight
+        } else {
+            theme.panel
+        };
         fill(frame.buffer_mut(), row, Style::default().bg(bg));
         let label_style = Style::default()
             .fg(theme.text)
@@ -579,7 +618,11 @@ fn render_menu_rows(
             Paragraph::new(Line::from(vec![
                 Span::styled(item.label, label_style),
                 Span::styled(
-                    " ".repeat(row.width.saturating_sub(item.label.width() as u16 + key.width() as u16) as usize),
+                    " ".repeat(
+                        row.width
+                            .saturating_sub(item.label.width() as u16 + key.width() as u16)
+                            as usize,
+                    ),
                     Style::default().bg(bg),
                 ),
                 Span::styled(key, key_style),
@@ -675,7 +718,11 @@ fn render_slash_dropdown(
         };
         zones.slash_rows.push((row, visible_idx));
         let selected = visible_idx == app.slash_selected;
-        let bg = if selected { theme.highlight } else { theme.panel };
+        let bg = if selected {
+            theme.highlight
+        } else {
+            theme.panel
+        };
         fill(frame.buffer_mut(), row, Style::default().bg(bg));
         let display = cmd.display();
         let desc_width = row.width.saturating_sub(26) as usize;
@@ -687,7 +734,10 @@ fn render_slash_dropdown(
             ),
             Span::styled(
                 pad(&display, 22),
-                Style::default().fg(theme.text).bg(bg).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.text)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(desc, Style::default().fg(theme.muted).bg(bg)),
         ]);
