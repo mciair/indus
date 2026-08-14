@@ -45,16 +45,6 @@ impl ProviderId {
         }
     }
 
-    pub const fn slug(self) -> &'static str {
-        match self {
-            Self::OpenAi => "openai",
-            Self::Anthropic => "anthropic",
-            Self::Gemini => "gemini",
-            Self::Groq => "groq",
-            Self::OpenRouter => "openrouter",
-        }
-    }
-
     pub const fn base_url(self) -> &'static str {
         match self {
             Self::OpenAi => "https://api.openai.com/v1",
