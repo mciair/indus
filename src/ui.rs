@@ -687,6 +687,7 @@ fn render_turn_status(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Them
         TurnActivity::Cancelling => theme.accent_error,
         TurnActivity::WaitingForPermission => theme.warning,
         TurnActivity::Classifying
+        | TurnActivity::Compacting
         | TurnActivity::Thinking
         | TurnActivity::Responding
         | TurnActivity::WaitingForResponse => theme.text_secondary,
