@@ -721,10 +721,10 @@ impl HarnessTool for WebSearchTool {
         let input: WebSearchInput = parse(input)?;
         context.check_cancelled()?;
         let mut url = "https://mcp.exa.ai/mcp".to_string();
-        if let Ok(key) = std::env::var("EXA_API_KEY") {
-            if !key.is_empty() {
-                url.push_str(&format!("?exaApiKey={}", urlencoding::encode(&key)));
-            }
+        if let Ok(key) = std::env::var("EXA_API_KEY")
+            && !key.is_empty()
+        {
+            url.push_str(&format!("?exaApiKey={}", urlencoding::encode(&key)));
         }
         let request = json!({
             "jsonrpc": "2.0",
