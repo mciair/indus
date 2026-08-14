@@ -6,6 +6,7 @@ use std::{
 };
 
 use ratatui::layout::Rect;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     harness::event::{FileDiff, HarnessEvent, PermissionReply, RunOutcome},
@@ -61,6 +62,27 @@ pub struct HitZones {
     pub slash_rows: Vec<(Rect, usize)>,
     pub fold_rows: Vec<(Rect, usize)>,
     pub catalog_rows: Vec<(Rect, usize)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SelectionPoint {
+    row: usize,
+    byte: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TextSelection {
+    anchor: SelectionPoint,
+    head: SelectionPoint,
+    dragging: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TranscriptViewport {
+    area: Rect,
+    rows: Vec<String>,
+    start_row: usize,
+    visible_rows: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -295,6 +317,12 @@ pub struct App {
     pub animation_tick: u64,
     pub running: bool,
     pub hit_zones: HitZones,
+    transcript_viewport: TranscriptViewport,
+    transcript_scroll: usize,
+    transcript_follow: bool,
+    text_selection: Option<TextSelection>,
+    selection_mouse: Option<(u16, u16)>,
+    selection_autoscroll: i8,
     pending_submission: Option<String>,
     pending_permission_reply: Option<(u64, PermissionReply)>,
     thinking_entries: HashMap<String, (usize, Instant)>,
@@ -328,6 +356,12 @@ impl App {
             animation_tick: 0,
             running: true,
             hit_zones: HitZones::default(),
+            transcript_viewport: TranscriptViewport::default(),
+            transcript_scroll: 0,
+            transcript_follow: true,
+            text_selection: None,
+            selection_mouse: None,
+            selection_autoscroll: 0,
             pending_submission: None,
             pending_permission_reply: None,
             thinking_entries: HashMap::new(),
@@ -341,6 +375,219 @@ impl App {
 
     pub fn active_model(&self) -> Option<&ModelSelection> {
         self.provider_store.active_selection()
+    }
+
+    pub fn sync_transcript_viewport(&mut self, area: Rect, rows: Vec<String>) -> usize {
+        let visible_rows = area.height as usize;
+        let maximum = rows.len().saturating_sub(visible_rows);
+        if self.transcript_follow {
+            self.transcript_scroll = maximum;
+        } else {
+            self.transcript_scroll = self.transcript_scroll.min(maximum);
+        }
+        self.transcript_viewport = TranscriptViewport {
+            area,
+            rows,
+            start_row: self.transcript_scroll,
+            visible_rows,
+        };
+        self.reclamp_selection_head();
+        self.transcript_scroll
+    }
+
+    pub fn scroll_transcript_up(&mut self, rows: usize) {
+        if self.transcript_viewport.rows.is_empty() {
+            return;
+        }
+        self.transcript_follow = false;
+        self.transcript_scroll = self.transcript_scroll.saturating_sub(rows);
+        self.text_selection = self.text_selection.filter(|selection| selection.dragging);
+    }
+
+    pub fn scroll_transcript_down(&mut self, rows: usize) {
+        let maximum = self
+            .transcript_viewport
+            .rows
+            .len()
+            .saturating_sub(self.transcript_viewport.visible_rows);
+        self.transcript_scroll = self.transcript_scroll.saturating_add(rows).min(maximum);
+        if self.transcript_scroll == maximum {
+            self.transcript_follow = true;
+        }
+        self.text_selection = self.text_selection.filter(|selection| selection.dragging);
+    }
+
+    pub fn page_transcript_up(&mut self) {
+        self.scroll_transcript_up(
+            self.transcript_viewport
+                .visible_rows
+                .saturating_sub(1)
+                .max(1),
+        );
+    }
+
+    pub fn page_transcript_down(&mut self) {
+        self.scroll_transcript_down(
+            self.transcript_viewport
+                .visible_rows
+                .saturating_sub(1)
+                .max(1),
+        );
+    }
+
+    pub fn scroll_transcript_to_top(&mut self) {
+        if !self.transcript_viewport.rows.is_empty() {
+            self.transcript_follow = false;
+            self.transcript_scroll = 0;
+            self.text_selection = None;
+        }
+    }
+
+    pub fn scroll_transcript_to_bottom(&mut self) {
+        self.transcript_follow = true;
+        self.transcript_scroll = self
+            .transcript_viewport
+            .rows
+            .len()
+            .saturating_sub(self.transcript_viewport.visible_rows);
+        self.text_selection = None;
+    }
+
+    pub fn transcript_contains(&self, column: u16, row: u16) -> bool {
+        self.transcript_viewport.area.contains((column, row).into())
+    }
+
+    pub fn begin_text_selection(&mut self, column: u16, row: u16) -> bool {
+        let Some(point) = self.selection_point_at(column, row, false) else {
+            self.text_selection = None;
+            return false;
+        };
+        self.text_selection = Some(TextSelection {
+            anchor: point,
+            head: point,
+            dragging: true,
+        });
+        self.selection_mouse = Some((column, row));
+        self.selection_autoscroll = 0;
+        true
+    }
+
+    pub fn is_selecting_text(&self) -> bool {
+        self.text_selection
+            .is_some_and(|selection| selection.dragging)
+    }
+
+    pub fn update_text_selection(&mut self, column: u16, row: u16) -> bool {
+        let Some(selection) = self.text_selection.as_ref() else {
+            return false;
+        };
+        if !selection.dragging {
+            return false;
+        }
+        self.selection_mouse = Some((column, row));
+        let area = self.transcript_viewport.area;
+        self.selection_autoscroll = if row <= area.y {
+            -1
+        } else if row >= area.bottom().saturating_sub(1) {
+            1
+        } else {
+            0
+        };
+        let Some(point) = self.selection_point_at(column, row, true) else {
+            return true;
+        };
+        if let Some(selection) = self.text_selection.as_mut() {
+            selection.head = point;
+        }
+        true
+    }
+
+    pub fn finish_text_selection(&mut self) -> Option<String> {
+        self.selection_autoscroll = 0;
+        self.selection_mouse = None;
+        let mut selection = self.text_selection?;
+        selection.dragging = false;
+        if selection.anchor == selection.head {
+            self.text_selection = None;
+            return None;
+        }
+        self.text_selection = Some(selection);
+        let text = self.selected_text(selection);
+        (!text.is_empty()).then_some(text)
+    }
+
+    pub fn selection_display_range(&self, row: usize) -> Option<(usize, usize)> {
+        let selection = self.text_selection?;
+        if selection.dragging && selection.anchor == selection.head {
+            return None;
+        }
+        let line = self.transcript_viewport.rows.get(row)?;
+        let range = selected_byte_range(selection, row, line)?;
+        Some((line[..range.start].width(), line[..range.end].width()))
+    }
+
+    pub fn transcript_scroll_metrics(&self) -> (usize, usize, usize) {
+        (
+            self.transcript_scroll,
+            self.transcript_viewport.visible_rows,
+            self.transcript_viewport.rows.len(),
+        )
+    }
+
+    fn selection_point_at(&self, column: u16, row: u16, nearest: bool) -> Option<SelectionPoint> {
+        let area = self.transcript_viewport.area;
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
+        let viewport_row = if nearest {
+            row.saturating_sub(area.y)
+                .min(area.height.saturating_sub(1)) as usize
+        } else {
+            if !area.contains((column, row).into()) {
+                return None;
+            }
+            (row - area.y) as usize
+        };
+        let global_row = self.transcript_viewport.start_row + viewport_row;
+        let line = self.transcript_viewport.rows.get(global_row)?;
+        if !nearest && (line.is_empty() || column.saturating_sub(area.x) as usize >= line.width()) {
+            return None;
+        }
+        Some(SelectionPoint {
+            row: global_row,
+            byte: byte_at_display_column(line, column.saturating_sub(area.x) as usize),
+        })
+    }
+
+    fn selected_text(&self, selection: TextSelection) -> String {
+        let (first, last) = ordered_selection(selection);
+        let mut output = String::new();
+        for row in first.row..=last.row {
+            let Some(line) = self.transcript_viewport.rows.get(row) else {
+                break;
+            };
+            if let Some(range) = selected_byte_range(selection, row, line) {
+                output.push_str(&line[range]);
+            }
+            if row != last.row {
+                output.push('\n');
+            }
+        }
+        output
+    }
+
+    fn reclamp_selection_head(&mut self) {
+        let Some((column, row)) = self.selection_mouse else {
+            return;
+        };
+        let Some(point) = self.selection_point_at(column, row, true) else {
+            return;
+        };
+        if let Some(selection) = self.text_selection.as_mut()
+            && selection.dragging
+        {
+            selection.head = point;
+        }
     }
 
     pub fn open_provider_catalog(&mut self) {
@@ -902,7 +1149,10 @@ impl App {
     pub fn toggle_fold(&mut self, index: usize) {
         match self.transcript.get_mut(index) {
             Some(TranscriptEntry::Thinking { expanded, .. })
-            | Some(TranscriptEntry::Tool { expanded, .. }) => *expanded = !*expanded,
+            | Some(TranscriptEntry::Tool { expanded, .. }) => {
+                *expanded = !*expanded;
+                self.text_selection = None;
+            }
             _ => {}
         }
     }
@@ -965,6 +1215,13 @@ impl App {
 
     pub fn on_tick(&mut self) {
         self.animation_tick = self.animation_tick.wrapping_add(1);
+        if self.animation_tick.is_multiple_of(2) {
+            match self.selection_autoscroll {
+                -1 => self.scroll_transcript_up(1),
+                1 => self.scroll_transcript_down(1),
+                _ => {}
+            }
+        }
     }
 
     fn preview_selected_argument(&mut self) {
@@ -1046,6 +1303,56 @@ impl App {
         }
         true
     }
+}
+
+fn byte_at_display_column(line: &str, column: usize) -> usize {
+    let mut display_column = 0usize;
+    let mut last = 0;
+    for (byte, ch) in line.char_indices() {
+        last = byte;
+        let width = ch.width().unwrap_or(0);
+        if column < display_column.saturating_add(width.max(1)) {
+            return byte;
+        }
+        display_column = display_column.saturating_add(width);
+    }
+    last
+}
+
+fn ordered_selection(selection: TextSelection) -> (SelectionPoint, SelectionPoint) {
+    if selection.anchor <= selection.head {
+        (selection.anchor, selection.head)
+    } else {
+        (selection.head, selection.anchor)
+    }
+}
+
+fn selected_byte_range(selection: TextSelection, row: usize, line: &str) -> Option<Range<usize>> {
+    let (first, last) = ordered_selection(selection);
+    if row < first.row || row > last.row {
+        return None;
+    }
+    let start = if row == first.row {
+        first.byte.min(line.len())
+    } else {
+        0
+    };
+    let end = if row == last.row {
+        next_char_boundary(line, last.byte)
+    } else {
+        line.len()
+    };
+    (start <= end).then_some(start..end)
+}
+
+fn next_char_boundary(line: &str, byte: usize) -> usize {
+    if byte >= line.len() {
+        return line.len();
+    }
+    line[byte..]
+        .chars()
+        .next()
+        .map_or(line.len(), |ch| byte + ch.len_utf8())
 }
 
 impl From<ModelCatalogView> for CatalogModal {
@@ -1199,5 +1506,50 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn transcript_scrolling_leaves_follow_mode_until_bottom_is_reached() {
+        let mut app = App::new();
+        let area = Rect::new(2, 3, 20, 2);
+        let rows = ["one", "two", "three", "four", "five"]
+            .map(str::to_string)
+            .to_vec();
+        assert_eq!(app.sync_transcript_viewport(area, rows.clone()), 3);
+
+        app.scroll_transcript_up(2);
+        assert_eq!(app.sync_transcript_viewport(area, rows.clone()), 1);
+
+        let mut extended = rows;
+        extended.push("six".to_string());
+        assert_eq!(app.sync_transcript_viewport(area, extended.clone()), 1);
+
+        app.scroll_transcript_down(usize::MAX);
+        assert_eq!(app.sync_transcript_viewport(area, extended), 4);
+    }
+
+    #[test]
+    fn drag_selection_reconstructs_unicode_text_across_rows() {
+        let mut app = App::new();
+        let area = Rect::new(2, 5, 20, 3);
+        app.sync_transcript_viewport(
+            area,
+            ["hello", "héllo", "world"].map(str::to_string).to_vec(),
+        );
+
+        assert!(app.begin_text_selection(2, 5));
+        assert!(app.update_text_selection(3, 6));
+        assert_eq!(app.finish_text_selection().as_deref(), Some("hello\nhé"));
+        assert_eq!(app.selection_display_range(0), Some((0, 5)));
+        assert_eq!(app.selection_display_range(1), Some((0, 2)));
+    }
+
+    #[test]
+    fn a_click_without_a_drag_does_not_create_a_selection() {
+        let mut app = App::new();
+        app.sync_transcript_viewport(Rect::new(0, 0, 20, 1), vec!["hello".to_string()]);
+        assert!(app.begin_text_selection(1, 0));
+        assert_eq!(app.finish_text_selection(), None);
+        assert_eq!(app.selection_display_range(0), None);
     }
 }
