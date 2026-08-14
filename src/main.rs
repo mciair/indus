@@ -1,5 +1,5 @@
 mod app;
-mod harness;
+pub mod harness;
 mod slash;
 mod theme;
 mod ui;
@@ -16,6 +16,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use harness::{Harness, event::PermissionReply};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use slash::CompletionPhase;
 
@@ -38,22 +39,29 @@ fn main() -> Result<()> {
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::new();
+    let harness = Harness::provider_neutral();
     while app.running {
+        for event in harness.drain_events() {
+            app.apply_harness_event(event);
+        }
         terminal.draw(|frame| ui::render(frame, &mut app))?;
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(&mut app, key),
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    handle_key(&mut app, &harness, key)
+                }
                 Event::Mouse(mouse) => handle_mouse(&mut app, mouse),
                 Event::Resize(_, _) => {}
                 _ => {}
             }
         }
+        dispatch_app_commands(&mut app, &harness);
         app.on_tick();
     }
     Ok(())
 }
 
-fn handle_key(app: &mut App, key: KeyEvent) {
+fn handle_key(app: &mut App, harness: &Harness, key: KeyEvent) {
     if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('q') {
         app.running = false;
         return;
@@ -62,8 +70,25 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         open_alpha();
         return;
     }
+    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('e') {
+        app.toggle_all_thinking();
+        return;
+    }
+    if app.permission.is_some() && key.modifiers.is_empty() {
+        let reply = match key.code {
+            KeyCode::Char('y') => Some(PermissionReply::AllowOnce),
+            KeyCode::Char('a') => Some(PermissionReply::AllowAlways),
+            KeyCode::Char('n') | KeyCode::Esc => Some(PermissionReply::Reject),
+            _ => None,
+        };
+        if let Some(reply) = reply {
+            app.resolve_permission(reply);
+        }
+        return;
+    }
     if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
         if app.turn.is_some() {
+            harness.cancel();
             app.cancel_turn();
         } else if !app.composer.is_empty() {
             app.edit_composer(|composer| {
@@ -80,6 +105,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
             if app.turn.is_some() {
+                harness.cancel();
                 app.cancel_turn();
             } else if !app.composer.is_empty() {
                 app.edit_composer(|composer| {
@@ -170,6 +196,16 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         return;
     }
 
+    let fold_hit = app
+        .hit_zones
+        .fold_rows
+        .iter()
+        .find_map(|(area, index)| contains(*area, x, y).then_some(*index));
+    if let Some(index) = fold_hit {
+        app.toggle_fold(index);
+        return;
+    }
+
     let slash_hit = app
         .hit_zones
         .slash_rows
@@ -193,6 +229,24 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     if let Some((index, action)) = menu_hit {
         app.selected_menu = index;
         app.run_menu_action(action);
+    }
+}
+
+fn dispatch_app_commands(app: &mut App, harness: &Harness) {
+    if let Some(prompt) = app.take_submission()
+        && let Err(error) = harness.submit(prompt)
+    {
+        app.apply_harness_event(harness::event::HarnessEvent::RunError {
+            run_id: 0,
+            message: error.to_string(),
+        });
+        app.apply_harness_event(harness::event::HarnessEvent::RunFinished {
+            run_id: 0,
+            outcome: harness::event::RunOutcome::Failed,
+        });
+    }
+    if let Some((request_id, reply)) = app.take_permission_reply() {
+        harness.reply_permission(request_id, reply);
     }
 }
 
