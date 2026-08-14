@@ -9,6 +9,9 @@ use ratatui::layout::Rect;
 
 use crate::{
     harness::event::{FileDiff, HarnessEvent, PermissionReply, RunOutcome},
+    provider::{
+        DiscoveryErrorKind, ModelDiscovery, ModelRecord, ModelSelection, ProviderId, ProviderStore,
+    },
     slash::{COMMANDS, CompletionPhase, SlashMenu},
     theme::ThemeKind,
 };
@@ -57,6 +60,7 @@ pub struct HitZones {
     pub alpha: Option<Rect>,
     pub slash_rows: Vec<(Rect, usize)>,
     pub fold_rows: Vec<(Rect, usize)>,
+    pub catalog_rows: Vec<(Rect, usize)>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -248,6 +252,28 @@ pub struct PermissionPrompt {
     pub patterns: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelCatalogView {
+    pub provider: ProviderId,
+    pub models: Vec<ModelRecord>,
+    pub selected: usize,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CatalogModal {
+    Providers {
+        selected: usize,
+    },
+    Models(ModelCatalogView),
+    ApiKey {
+        provider: ProviderId,
+        input: Composer,
+        error: Option<String>,
+    },
+}
+
 pub struct App {
     pub cwd: PathBuf,
     pub composer: Composer,
@@ -259,6 +285,7 @@ pub struct App {
     pub preview_theme: Option<ThemeKind>,
     pub turn: Option<ActiveTurn>,
     pub permission: Option<PermissionPrompt>,
+    pub catalog_modal: Option<CatalogModal>,
     pub animation_tick: u64,
     pub running: bool,
     pub hit_zones: HitZones,
@@ -267,6 +294,9 @@ pub struct App {
     thinking_entries: HashMap<String, (usize, Instant)>,
     assistant_entries: HashMap<String, usize>,
     tool_entries: HashMap<String, (usize, Instant)>,
+    provider_store: ProviderStore,
+    model_discovery: ModelDiscovery,
+    pending_provider_key: Option<(ProviderId, String)>,
 }
 
 impl App {
@@ -276,6 +306,7 @@ impl App {
             .and_then(|name| ThemeKind::from_name(&name))
             .or_else(load_theme_preference)
             .unwrap_or_default();
+        let provider_store = ProviderStore::load();
         Self {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             composer: Composer::default(),
@@ -287,6 +318,7 @@ impl App {
             preview_theme: None,
             turn: None,
             permission: None,
+            catalog_modal: None,
             animation_tick: 0,
             running: true,
             hit_zones: HitZones::default(),
@@ -295,7 +327,229 @@ impl App {
             thinking_entries: HashMap::new(),
             assistant_entries: HashMap::new(),
             tool_entries: HashMap::new(),
+            provider_store,
+            model_discovery: ModelDiscovery::new(),
+            pending_provider_key: None,
         }
+    }
+
+    pub fn active_model(&self) -> Option<&ModelSelection> {
+        self.provider_store.active_selection()
+    }
+
+    pub fn open_provider_catalog(&mut self) {
+        let selected = self
+            .active_model()
+            .and_then(|active| {
+                ProviderId::ALL
+                    .iter()
+                    .position(|provider| *provider == active.provider)
+            })
+            .unwrap_or(0);
+        self.close_slash();
+        self.catalog_modal = Some(CatalogModal::Providers { selected });
+    }
+
+    pub fn close_catalog_level(&mut self) {
+        self.catalog_modal = match self.catalog_modal.take() {
+            Some(CatalogModal::Providers { .. }) | None => None,
+            Some(CatalogModal::Models(view)) => Some(CatalogModal::Providers {
+                selected: provider_index(view.provider),
+            }),
+            Some(CatalogModal::ApiKey { provider, .. }) => Some(CatalogModal::Providers {
+                selected: provider_index(provider),
+            }),
+        };
+    }
+
+    pub fn move_catalog_selection(&mut self, delta: isize) {
+        let (selected, len) = match self.catalog_modal.as_mut() {
+            Some(CatalogModal::Providers { selected }) => (selected, ProviderId::ALL.len()),
+            Some(CatalogModal::Models(view)) => (&mut view.selected, view.models.len()),
+            _ => return,
+        };
+        if len > 0 {
+            *selected = (*selected as isize + delta).rem_euclid(len as isize) as usize;
+        }
+    }
+
+    pub fn select_catalog_index(&mut self, index: usize) {
+        match self.catalog_modal.as_mut() {
+            Some(CatalogModal::Providers { selected }) if index < ProviderId::ALL.len() => {
+                *selected = index;
+            }
+            Some(CatalogModal::Models(view)) if index < view.models.len() => {
+                view.selected = index;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn submit_catalog_selection(&mut self) {
+        match self.catalog_modal.take() {
+            Some(CatalogModal::Providers { selected }) => {
+                self.open_provider(ProviderId::ALL[selected.min(ProviderId::ALL.len() - 1)]);
+            }
+            Some(CatalogModal::Models(mut view)) => {
+                let Some(model) = view.models.get(view.selected).cloned() else {
+                    self.catalog_modal = Some(CatalogModal::Models(view));
+                    return;
+                };
+                match self.provider_store.select_model(view.provider, &model) {
+                    Ok(()) => {
+                        self.transcript.push(TranscriptEntry::Event(format!(
+                            "Using {} through {}.",
+                            model.name,
+                            view.provider.name()
+                        )));
+                    }
+                    Err(error) => {
+                        view.error = Some(format!("Could not save model preference: {error}"));
+                        self.catalog_modal = Some(CatalogModal::Models(view));
+                    }
+                }
+            }
+            Some(CatalogModal::ApiKey {
+                provider,
+                mut input,
+                error,
+            }) => {
+                let key = input.clear();
+                if key.trim().is_empty() {
+                    self.catalog_modal = Some(CatalogModal::ApiKey {
+                        provider,
+                        input,
+                        error: Some("Enter an API key.".to_string()),
+                    });
+                    return;
+                }
+                self.pending_provider_key = Some((provider, key.clone()));
+                self.catalog_modal = Some(
+                    ModelCatalogView {
+                        provider,
+                        models: self.provider_store.cached_models(provider).to_vec(),
+                        selected: self.recent_model_index(provider),
+                        loading: true,
+                        error,
+                    }
+                    .into(),
+                );
+                self.model_discovery.fetch(provider, key);
+            }
+            None => {}
+        }
+    }
+
+    pub fn edit_api_key(&mut self, edit: impl FnOnce(&mut Composer)) {
+        if let Some(CatalogModal::ApiKey { input, error, .. }) = self.catalog_modal.as_mut() {
+            edit(input);
+            *error = None;
+        }
+    }
+
+    pub fn refresh_model_catalog(&mut self) {
+        let Some(CatalogModal::Models(view)) = self.catalog_modal.as_mut() else {
+            return;
+        };
+        let provider = view.provider;
+        let Some(key) = self.provider_store.api_key(provider).map(str::to_string) else {
+            self.catalog_modal = Some(CatalogModal::ApiKey {
+                provider,
+                input: Composer::default(),
+                error: None,
+            });
+            return;
+        };
+        view.loading = true;
+        view.error = None;
+        self.model_discovery.fetch(provider, key);
+    }
+
+    pub fn replace_provider_key(&mut self) {
+        let Some(CatalogModal::Models(view)) = self.catalog_modal.take() else {
+            return;
+        };
+        self.catalog_modal = Some(CatalogModal::ApiKey {
+            provider: view.provider,
+            input: Composer::default(),
+            error: None,
+        });
+    }
+
+    pub fn process_model_discovery(&mut self) {
+        for event in self.model_discovery.drain() {
+            let validated_key = self
+                .pending_provider_key
+                .take_if(|(provider, _)| *provider == event.provider)
+                .map(|(_, key)| key);
+            match event.result {
+                Ok(models) => {
+                    let persistence = self.provider_store.accept_models(
+                        event.provider,
+                        models.clone(),
+                        validated_key,
+                    );
+                    if let Some(CatalogModal::Models(view)) = self.catalog_modal.as_mut()
+                        && view.provider == event.provider
+                    {
+                        view.models = models;
+                        view.selected = recent_model_index(
+                            self.provider_store.recent_model(event.provider),
+                            &view.models,
+                        );
+                        view.loading = false;
+                        view.error = persistence
+                            .err()
+                            .map(|error| format!("Could not save provider settings: {error}"));
+                    }
+                }
+                Err(error) if error.kind == DiscoveryErrorKind::Authentication => {
+                    if self.catalog_modal.as_ref().is_some_and(|modal| {
+                        matches!(modal, CatalogModal::Models(view) if view.provider == event.provider)
+                    }) {
+                        self.catalog_modal = Some(CatalogModal::ApiKey {
+                            provider: event.provider,
+                            input: Composer::default(),
+                            error: Some(error.message),
+                        });
+                    }
+                }
+                Err(error) => {
+                    if let Some(CatalogModal::Models(view)) = self.catalog_modal.as_mut()
+                        && view.provider == event.provider
+                    {
+                        view.loading = false;
+                        view.error = Some(error.message);
+                    }
+                }
+            }
+        }
+    }
+
+    fn open_provider(&mut self, provider: ProviderId) {
+        let Some(key) = self.provider_store.api_key(provider).map(str::to_string) else {
+            self.catalog_modal = Some(CatalogModal::ApiKey {
+                provider,
+                input: Composer::default(),
+                error: None,
+            });
+            return;
+        };
+        self.catalog_modal = Some(CatalogModal::Models(ModelCatalogView {
+            provider,
+            models: self.provider_store.cached_models(provider).to_vec(),
+            selected: self.recent_model_index(provider),
+            loading: true,
+            error: None,
+        }));
+        self.model_discovery.fetch(provider, key);
+    }
+
+    fn recent_model_index(&self, provider: ProviderId) -> usize {
+        recent_model_index(
+            self.provider_store.recent_model(provider),
+            self.provider_store.cached_models(provider),
+        )
     }
 
     pub fn effective_theme_kind(&self) -> ThemeKind {
@@ -731,6 +985,7 @@ impl App {
                 self.preview_theme = None;
                 persist_theme_preference(next);
             }
+            "model" => self.open_provider_catalog(),
             "help" => self.transcript.push(TranscriptEntry::Event(
                 "Type / to browse commands. Use Tab to complete and Enter to run.".to_string(),
             )),
@@ -740,6 +995,25 @@ impl App {
         }
         true
     }
+}
+
+impl From<ModelCatalogView> for CatalogModal {
+    fn from(view: ModelCatalogView) -> Self {
+        Self::Models(view)
+    }
+}
+
+fn provider_index(provider: ProviderId) -> usize {
+    ProviderId::ALL
+        .iter()
+        .position(|candidate| *candidate == provider)
+        .unwrap_or(0)
+}
+
+fn recent_model_index(recent: Option<&str>, models: &[ModelRecord]) -> usize {
+    recent
+        .and_then(|id| models.iter().position(|model| model.id == id))
+        .unwrap_or(0)
 }
 
 fn theme_config_path() -> Option<PathBuf> {
