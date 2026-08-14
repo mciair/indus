@@ -1,5 +1,7 @@
 //! Events emitted by the Indus harness for presentation and external clients.
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunOutcome {
     Completed,
@@ -17,14 +19,14 @@ pub enum PermissionReply {
     Reject,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DiffKind {
     Context,
     Added,
     Removed,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiffLine {
     pub old_line: Option<usize>,
     pub new_line: Option<usize>,
@@ -32,7 +34,7 @@ pub struct DiffLine {
     pub text: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileDiff {
     pub path: String,
     pub lines: Vec<DiffLine>,
