@@ -1,6 +1,7 @@
 //! Durable in-memory session state projected from harness stream events.
 
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
     event::FileDiff,
@@ -94,6 +95,18 @@ pub enum SessionMessage {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub directory: String,
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
     pub messages: Vec<SessionMessage>,
     #[serde(default)]
     next_message_id: u64,
@@ -101,11 +114,117 @@ pub struct Session {
 
 impl Session {
     pub fn new(id: impl Into<String>) -> Self {
+        let id = id.into();
+        let timestamp = if id.is_empty() { 0 } else { now_ms() };
         Self {
-            id: id.into(),
+            id,
+            title: None,
+            directory: String::new(),
+            provider_id: None,
+            model_id: None,
+            created_at: timestamp,
+            updated_at: timestamp,
             messages: Vec::new(),
             next_message_id: 0,
         }
+    }
+
+    pub fn unallocated(directory: impl Into<String>) -> Self {
+        let mut session = Self::new("");
+        session.directory = directory.into();
+        session
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore(
+        id: String,
+        title: String,
+        directory: String,
+        provider_id: Option<String>,
+        model_id: Option<String>,
+        created_at: i64,
+        updated_at: i64,
+        messages: Vec<SessionMessage>,
+    ) -> Self {
+        let next_message_id = messages
+            .iter()
+            .map(|message| match message {
+                SessionMessage::User(message) => message.id,
+                SessionMessage::Assistant(message) => message.id,
+            })
+            .max()
+            .unwrap_or(0);
+        Self {
+            id,
+            title: Some(title),
+            directory,
+            provider_id,
+            model_id,
+            created_at,
+            updated_at,
+            messages,
+            next_message_id,
+        }
+    }
+
+    pub fn is_allocated(&self) -> bool {
+        self.id.starts_with("ses-i_")
+            && self
+                .title
+                .as_deref()
+                .is_some_and(|title| !title.trim().is_empty())
+    }
+
+    pub fn allocate(
+        &mut self,
+        id: impl Into<String>,
+        title: impl Into<String>,
+        provider_id: Option<String>,
+        model_id: Option<String>,
+    ) -> bool {
+        if self.is_allocated() {
+            return false;
+        }
+        let title = title.into().trim().to_string();
+        let id = id.into();
+        if title.is_empty() || !id.starts_with("ses-i_") {
+            return false;
+        }
+        let timestamp = now_ms();
+        self.id = id;
+        self.title = Some(title);
+        self.provider_id = provider_id;
+        self.model_id = model_id;
+        self.created_at = timestamp;
+        self.updated_at = timestamp;
+        true
+    }
+
+    pub fn rename(&mut self, title: impl Into<String>) -> bool {
+        if !self.is_allocated() {
+            return false;
+        }
+        let title = title.into().trim().to_string();
+        if title.is_empty() {
+            return false;
+        }
+        self.title = Some(title);
+        self.touch();
+        true
+    }
+
+    pub fn rewind_last_turn(&mut self) -> Option<String> {
+        let index = self
+            .messages
+            .iter()
+            .rposition(|message| matches!(message, SessionMessage::User(_)))?;
+        let SessionMessage::User(message) = &self.messages[index] else {
+            return None;
+        };
+        let prompt = message.text.clone();
+        self.messages.truncate(index);
+        self.touch();
+        Some(prompt)
     }
 
     pub fn push_user(&mut self, text: impl Into<String>) -> u64 {
@@ -114,6 +233,7 @@ impl Session {
             id,
             text: text.into(),
         }));
+        self.touch();
         id
     }
 
@@ -123,6 +243,7 @@ impl Session {
 
     pub fn push_assistant(&mut self, message: AssistantMessage) {
         self.messages.push(SessionMessage::Assistant(message));
+        self.touch();
     }
 
     pub fn model_messages(&self) -> Vec<ModelMessage> {
@@ -263,11 +384,25 @@ impl Session {
         self.next_message_id = self.next_message_id.saturating_add(1);
         self.next_message_id
     }
+
+    fn touch(&mut self) {
+        if self.is_allocated() {
+            self.updated_at = now_ms();
+        }
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 impl Default for Session {
     fn default() -> Self {
-        Self::new("default")
+        Self::unallocated("")
     }
 }
 
@@ -319,5 +454,49 @@ mod tests {
         session.push_assistant(second_assistant);
 
         assert_eq!(session.current_context_tokens(), 80_000);
+    }
+
+    #[test]
+    fn restored_sessions_continue_message_identifiers() {
+        let messages = vec![SessionMessage::User(UserMessage {
+            id: 7,
+            text: "existing".into(),
+        })];
+        let mut session = Session::restore(
+            "ses-i_example".into(),
+            "Existing session".into(),
+            "/tmp".into(),
+            None,
+            None,
+            1,
+            2,
+            messages,
+        );
+
+        assert_eq!(session.push_user("next"), 8);
+    }
+
+    #[test]
+    fn rewinding_removes_the_latest_turn_and_preserves_earlier_history() {
+        let mut session = Session::unallocated("/workspace");
+        let first = session.push_user("first");
+        let first_answer = session.next_assistant(first);
+        session.push_assistant(first_answer);
+        session.push_user("edit this prompt");
+
+        assert_eq!(
+            session.rewind_last_turn().as_deref(),
+            Some("edit this prompt")
+        );
+        assert_eq!(session.messages.len(), 2);
+    }
+
+    #[test]
+    fn only_allocated_sessions_can_be_renamed() {
+        let mut session = Session::unallocated("/workspace");
+        assert!(!session.rename("Not persisted"));
+        assert!(session.allocate("ses-i_example", "Initial", None, None));
+        assert!(session.rename("Renamed Session"));
+        assert_eq!(session.title.as_deref(), Some("Renamed Session"));
     }
 }
