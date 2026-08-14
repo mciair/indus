@@ -220,10 +220,10 @@ fn handle_slash_key(app: &mut App, key: KeyEvent) -> bool {
                 .slash
                 .selection()
                 .is_some_and(|row| row.insert_text.ends_with(' '));
-            if app.accept_slash_completion() {
-                if matches!(phase, CompletionPhase::Arguments { .. }) || !chains {
-                    app.submit();
-                }
+            if app.accept_slash_completion()
+                && (matches!(phase, CompletionPhase::Arguments { .. }) || !chains)
+            {
+                app.submit();
             }
             true
         }
