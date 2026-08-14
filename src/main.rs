@@ -90,7 +90,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand::new("rename", "Rename the current session", "/rename <name>"),
     SlashCommand::new("dashboard", "Open the session dashboard", "/dashboard"),
     SlashCommand::new("cd", "Change working directory", "/cd <path>"),
-    SlashCommand::new("theme", "Change terminal theme", "/theme"),
+    SlashCommand::new(
+        "theme",
+        "Change terminal theme",
+        "/theme <auto|indus-night|indusday|indus-midnight|indus-warm>",
+    ),
     SlashCommand::new("feedback", "Send product feedback", "/feedback [message]"),
     SlashCommand::new(
         "announcements",
@@ -175,9 +179,11 @@ struct HitZones {
 struct App {
     cwd: PathBuf,
     input: String,
+    messages: Vec<String>,
     selected_menu: usize,
     slash_selected: usize,
     slash_scroll: usize,
+    theme_kind: ThemeKind,
     status: String,
     running: bool,
     hit_zones: HitZones,
@@ -188,9 +194,11 @@ impl App {
         Self {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             input: String::new(),
+            messages: Vec::new(),
             selected_menu: 0,
             slash_selected: 0,
             slash_scroll: 0,
+            theme_kind: ThemeKind::IndusNight,
             status: "Ready. Type a prompt or / for commands.".to_string(),
             running: true,
             hit_zones: HitZones::default(),
@@ -258,7 +266,7 @@ impl App {
     }
 
     fn submit_input(&mut self) {
-        let text = self.input.trim();
+        let text = self.input.trim().to_string();
         if text.is_empty() {
             self.run_menu_action(HOME_MENU[self.selected_menu].action);
             return;
@@ -267,10 +275,38 @@ impl App {
             self.running = false;
             return;
         }
+        if let Some(args) = text.strip_prefix("/theme") {
+            self.apply_theme_command(args.trim());
+            self.input.clear();
+            self.slash_selected = 0;
+            self.slash_scroll = 0;
+            return;
+        }
         self.status = format!("Queued: {text}");
+        self.messages.push(text);
         self.input.clear();
         self.slash_selected = 0;
         self.slash_scroll = 0;
+    }
+
+    fn apply_theme_command(&mut self, args: &str) {
+        if args.is_empty() {
+            self.status =
+                "Themes: auto, indus-night, indusday, indus-midnight, indus-warm".to_string();
+            return;
+        }
+        let selected = args.split_whitespace().next().unwrap_or_default();
+        match ThemeKind::from_name(selected) {
+            Some(kind) => {
+                self.theme_kind = kind;
+                self.status = format!("Theme set to {}", kind.name());
+            }
+            None => {
+                self.status = format!(
+                    "Unknown theme '{selected}'. Use auto, indus-night, indusday, indus-midnight, or indus-warm."
+                );
+            }
+        }
     }
 
     fn run_menu_action(&mut self, action: MenuAction) {
@@ -444,7 +480,7 @@ fn contains(rect: Rect, x: u16, y: u16) -> bool {
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     let mut zones = HitZones::default();
-    let theme = Theme::default();
+    let theme = Theme::from_kind(app.theme_kind);
     let base = Block::default().style(Style::default().bg(theme.bg));
     frame.render_widget(base, area);
 
@@ -457,7 +493,11 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     .areas(area);
 
     render_top_bar(frame, top, app, &theme);
-    render_home(frame, body, app, &theme, &mut zones);
+    if app.messages.is_empty() {
+        render_home(frame, body, app, &theme, &mut zones);
+    } else {
+        render_chat(frame, body, app, &theme);
+    }
     render_status(frame, status, app, &theme);
     render_input(frame, input, app, &theme);
     if app.slash_open() {
@@ -528,7 +568,7 @@ fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, zone
         Span::styled(
             PRODUCT,
             Style::default()
-                .fg(theme.accent)
+                .fg(theme.text)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ", Style::default()),
@@ -541,7 +581,9 @@ fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, zone
     let cta_line = Line::from(vec![
         Span::styled(
             cta_text.clone(),
-            Style::default().fg(theme.link).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ", Style::default()),
         Span::styled(ALPHA_URL, Style::default().fg(theme.muted)),
@@ -557,6 +599,37 @@ fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, zone
 
     let _ = gap;
     zones.menu = render_menu_rows(frame, menu, app, theme);
+}
+
+fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    fill(frame.buffer_mut(), area, Style::default().bg(theme.chat_bg));
+    let content = area.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    let mut y = content.bottom().saturating_sub(1);
+    for message in app.messages.iter().rev() {
+        if y < content.y {
+            break;
+        }
+        let width = message.width().min(content.width.saturating_sub(6) as usize) as u16 + 4;
+        let x = content.right().saturating_sub(width);
+        let row = Rect {
+            x,
+            y,
+            width,
+            height: 1,
+        };
+        fill(frame.buffer_mut(), row, Style::default().bg(theme.sent_bg));
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  {}  ", truncate(message, width.saturating_sub(4) as usize)),
+                Style::default().fg(theme.sent_text).bg(theme.sent_bg),
+            ))),
+            row,
+        );
+        y = y.saturating_sub(2);
+    }
 }
 
 fn render_menu_rows(
@@ -627,15 +700,18 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme.border))
-        .style(Style::default().bg(theme.panel));
+        .border_style(Style::default().fg(theme.prompt_border_active))
+        .style(Style::default().bg(theme.input_bg));
     let text = if app.input.is_empty() {
         Line::from(Span::styled(
-            "Ask Indus to build, edit, explain…  / for commands",
-            Style::default().fg(theme.dim),
+            "Type a message...",
+            Style::default().fg(theme.input_placeholder),
         ))
     } else {
-        Line::from(Span::styled(&app.input, Style::default().fg(theme.text)))
+        Line::from(Span::styled(
+            &app.input,
+            Style::default().fg(theme.input_text),
+        ))
     };
     frame.render_widget(Paragraph::new(text).block(block), area);
     let cursor_x = area.x + 1 + app.input.width() as u16;
@@ -783,30 +859,161 @@ fn truncate(value: &str, width: usize) -> String {
 }
 
 #[derive(Clone, Copy)]
+enum ThemeKind {
+    Auto,
+    IndusNight,
+    IndusDay,
+    IndusMidnight,
+    IndusWarm,
+}
+
+impl ThemeKind {
+    fn from_name(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "indus-night" | "indusnight" | "night" | "dark" => Some(Self::IndusNight),
+            "indusday" | "indus-day" | "day" | "light" => Some(Self::IndusDay),
+            "indus-midnight" | "indusmidnight" | "midnight" | "oscura" => {
+                Some(Self::IndusMidnight)
+            }
+            "indus-warm" | "induswarm" | "warm" => Some(Self::IndusWarm),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::IndusNight => "indus-night",
+            Self::IndusDay => "indusday",
+            Self::IndusMidnight => "indus-midnight",
+            Self::IndusWarm => "indus-warm",
+        }
+    }
+
+    fn resolved(self) -> Self {
+        match self {
+            Self::Auto => Self::IndusNight,
+            other => other,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct Theme {
     bg: Color,
     panel: Color,
+    chat_bg: Color,
     highlight: Color,
     border: Color,
+    prompt_border_active: Color,
     text: Color,
     muted: Color,
     dim: Color,
     accent: Color,
-    link: Color,
+    warning: Color,
+    input_bg: Color,
+    input_text: Color,
+    input_placeholder: Color,
+    sent_bg: Color,
+    sent_text: Color,
 }
 
-impl Default for Theme {
-    fn default() -> Self {
-        Self {
-            bg: Color::Rgb(9, 10, 12),
-            panel: Color::Rgb(14, 15, 18),
-            highlight: Color::Rgb(38, 42, 50),
-            border: Color::Rgb(68, 72, 84),
-            text: Color::Rgb(236, 238, 242),
-            muted: Color::Rgb(152, 158, 171),
-            dim: Color::Rgb(91, 97, 110),
-            accent: Color::Rgb(43, 214, 155),
-            link: Color::Rgb(124, 184, 255),
+impl Theme {
+    fn from_kind(kind: ThemeKind) -> Self {
+        match kind.resolved() {
+            ThemeKind::Auto | ThemeKind::IndusNight => Self::indus_night(),
+            ThemeKind::IndusDay => Self::indus_day(),
+            ThemeKind::IndusMidnight => Self::indus_midnight(),
+            ThemeKind::IndusWarm => Self::indus_warm(),
         }
     }
+
+    fn indus_night() -> Self {
+        Self {
+            bg: rgb(20, 20, 20),
+            panel: rgb(28, 28, 28),
+            chat_bg: rgb(20, 20, 20),
+            highlight: rgb(54, 54, 54),
+            border: rgb(60, 60, 65),
+            prompt_border_active: rgb(80, 80, 88),
+            text: rgb(236, 238, 242),
+            muted: rgb(170, 170, 170),
+            dim: rgb(88, 88, 88),
+            accent: rgb(224, 175, 104),
+            warning: rgb(224, 175, 104),
+            input_bg: rgb(20, 20, 20),
+            input_text: rgb(236, 238, 242),
+            input_placeholder: rgb(88, 88, 88),
+            sent_bg: rgb(28, 28, 28),
+            sent_text: rgb(236, 238, 242),
+        }
+    }
+
+    fn indus_day() -> Self {
+        Self {
+            bg: rgb(224, 224, 224),
+            panel: rgb(238, 238, 238),
+            chat_bg: rgb(224, 224, 224),
+            highlight: rgb(198, 198, 198),
+            border: rgb(185, 185, 190),
+            prompt_border_active: rgb(165, 165, 175),
+            text: rgb(35, 35, 35),
+            muted: rgb(90, 90, 90),
+            dim: rgb(150, 150, 150),
+            accent: rgb(168, 120, 10),
+            warning: rgb(224, 175, 104),
+            input_bg: rgb(224, 224, 224),
+            input_text: rgb(35, 35, 35),
+            input_placeholder: rgb(120, 120, 120),
+            sent_bg: rgb(238, 238, 238),
+            sent_text: rgb(35, 35, 35),
+        }
+    }
+
+    fn indus_midnight() -> Self {
+        Self {
+            bg: rgb(4, 5, 10),
+            panel: rgb(14, 16, 24),
+            chat_bg: rgb(4, 5, 10),
+            highlight: rgb(31, 35, 49),
+            border: rgb(45, 50, 70),
+            prompt_border_active: rgb(72, 79, 108),
+            text: rgb(235, 239, 245),
+            muted: rgb(145, 151, 168),
+            dim: rgb(91, 98, 118),
+            accent: rgb(224, 175, 104),
+            warning: rgb(224, 175, 104),
+            input_bg: rgb(4, 5, 10),
+            input_text: rgb(235, 239, 245),
+            input_placeholder: rgb(91, 98, 118),
+            sent_bg: rgb(14, 16, 24),
+            sent_text: rgb(235, 239, 245),
+        }
+    }
+
+    fn indus_warm() -> Self {
+        Self {
+            bg: rgb(220, 173, 83),
+            panel: rgb(220, 173, 83),
+            chat_bg: rgb(220, 173, 83),
+            highlight: rgb(192, 121, 78),
+            border: rgb(120, 72, 45),
+            prompt_border_active: rgb(92, 54, 36),
+            text: Color::Black,
+            muted: Color::Black,
+            dim: Color::Black,
+            accent: Color::Black,
+            warning: Color::Black,
+            input_bg: rgb(196, 104, 70),
+            input_text: Color::Black,
+            input_placeholder: Color::Black,
+            sent_bg: rgb(196, 104, 70),
+            sent_text: Color::Black,
+        }
+    }
+}
+
+const fn rgb(r: u8, g: u8, b: u8) -> Color {
+    Color::Rgb(r, g, b)
 }
