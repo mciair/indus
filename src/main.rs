@@ -40,9 +40,10 @@ fn main() -> Result<()> {
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::new();
-    let harness = Harness::provider_neutral();
+    let harness = Harness::configured()?;
     while app.running {
         app.process_model_discovery();
+        harness.poll_jobs();
         for event in harness.drain_events() {
             app.apply_harness_event(event);
         }
