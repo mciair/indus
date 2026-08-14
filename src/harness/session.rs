@@ -1,31 +1,33 @@
 //! Durable in-memory session state projected from harness stream events.
 
+use serde::{Deserialize, Serialize};
+
 use super::{
     event::FileDiff,
     model::{ModelContent, ModelMessage, Role, StopReason, Usage},
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UserMessage {
     pub id: u64,
     pub text: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReasoningPart {
     pub id: String,
     pub text: String,
     pub completed: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TextPart {
     pub id: String,
     pub text: String,
     pub completed: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ToolState {
     Pending,
     Running,
@@ -39,7 +41,7 @@ pub enum ToolState {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ToolPart {
     pub call_id: String,
     pub name: String,
@@ -47,14 +49,14 @@ pub struct ToolPart {
     pub state: ToolState,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AssistantPart {
     Reasoning(ReasoningPart),
     Text(TextPart),
     Tool(ToolPart),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AssistantMessage {
     pub id: u64,
     pub parent_id: u64,
@@ -83,16 +85,17 @@ impl AssistantMessage {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SessionMessage {
     User(UserMessage),
     Assistant(AssistantMessage),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
     pub messages: Vec<SessionMessage>,
+    #[serde(default)]
     next_message_id: u64,
 }
 
@@ -193,6 +196,66 @@ impl Session {
             }
         }
         count
+    }
+
+    pub fn total_usage(&self) -> u64 {
+        self.messages
+            .iter()
+            .filter_map(|message| match message {
+                SessionMessage::Assistant(assistant) => Some(assistant.usage.total()),
+                SessionMessage::User(_) => None,
+            })
+            .fold(0, u64::saturating_add)
+    }
+
+    pub fn summary_source(&self, max_characters: usize) -> String {
+        let mut output = String::new();
+        for message in &self.messages {
+            let block = match message {
+                SessionMessage::User(user) => format!("User:\n{}\n\n", user.text),
+                SessionMessage::Assistant(assistant) => {
+                    let parts = assistant
+                        .parts
+                        .iter()
+                        .filter_map(|part| match part {
+                            AssistantPart::Text(text) => Some(text.text.clone()),
+                            AssistantPart::Tool(tool) => {
+                                let result = match &tool.state {
+                                    ToolState::Completed { output, .. } => output.as_str(),
+                                    ToolState::Failed { message } => message.as_str(),
+                                    ToolState::Pending | ToolState::Running => "incomplete",
+                                };
+                                Some(format!("Tool {}({}) => {result}", tool.name, tool.input))
+                            }
+                            AssistantPart::Reasoning(_) => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("Assistant:\n{parts}\n\n")
+                }
+            };
+            output.push_str(&block);
+            if output.len() > max_characters {
+                let mut start = output.len().saturating_sub(max_characters);
+                while !output.is_char_boundary(start) {
+                    start += 1;
+                }
+                output = format!("[Earlier transcript omitted]\n{}", &output[start..]);
+            }
+        }
+        output
+    }
+
+    pub fn compact(&mut self, summary: impl Into<String>, preserve_messages: usize) {
+        let keep_from = self.messages.len().saturating_sub(preserve_messages);
+        let preserved = self.messages.split_off(keep_from);
+        self.messages.clear();
+        let id = self.allocate_message_id();
+        self.messages.push(SessionMessage::User(UserMessage {
+            id,
+            text: format!("[Conversation summary]\n{}", summary.into().trim()),
+        }));
+        self.messages.extend(preserved);
     }
 
     fn allocate_message_id(&mut self) -> u64 {
