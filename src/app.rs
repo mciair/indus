@@ -198,6 +198,7 @@ pub enum ToolVisualState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TurnActivity {
     Classifying,
+    Compacting,
     WaitingForResponse,
     Thinking,
     Responding,
@@ -212,6 +213,7 @@ impl TurnActivity {
     pub fn label(&self) -> String {
         match self {
             Self::Classifying => "Classifying…".to_string(),
+            Self::Compacting => "Compacting context…".to_string(),
             Self::WaitingForResponse => "Waiting for response…".to_string(),
             Self::Thinking => "Thinking…".to_string(),
             Self::Responding => "Responding…".to_string(),
@@ -876,6 +878,14 @@ impl App {
             }
             HarnessEvent::RetryScheduled { attempt, .. } => {
                 self.set_turn_activity(TurnActivity::Retrying(attempt));
+            }
+            HarnessEvent::CompactionStarted { .. } => {
+                self.set_turn_activity(TurnActivity::Compacting);
+            }
+            HarnessEvent::CompactionFinished { .. } => {
+                self.set_turn_activity(TurnActivity::WaitingForResponse);
+                self.transcript
+                    .push(TranscriptEntry::Event("Context compacted.".to_string()));
             }
             HarnessEvent::CompactionRequired { .. } => self.transcript.push(
                 TranscriptEntry::Event("Conversation compaction required.".to_string()),
