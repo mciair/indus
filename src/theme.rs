@@ -67,6 +67,8 @@ impl ThemeKind {
     }
 }
 
+/// Complete semantic palette; some tokens are reserved for upcoming tool and media blocks.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct Theme {
     pub bg_base: Color,
