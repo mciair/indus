@@ -2,7 +2,7 @@ use std::{
     io,
     path::PathBuf,
     process::Command,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -27,28 +27,28 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const PRODUCT: &str = "Indus";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const ALPHA_LABEL: &str = "Meet Alpha:Where Ideas Diverge";
+const ALPHA_LABEL: &str = "Meet Alpha: Where Ideas Diverge";
 const ALPHA_URL: &str = "https://mciair.in/hc";
 
 const HOME_MENU: &[MenuItem] = &[
     MenuItem {
         label: "Changelog",
-        key: "c",
+        key: "Enter",
         action: MenuAction::Changelog,
     },
     MenuItem {
         label: "Resume Session",
-        key: "r",
+        key: "Enter",
         action: MenuAction::Resume,
     },
     MenuItem {
         label: "New Worktree",
-        key: "w",
+        key: "Enter",
         action: MenuAction::Worktree,
     },
     MenuItem {
         label: "Quit",
-        key: "q",
+        key: "Ctrl+Q",
         action: MenuAction::Quit,
     },
 ];
@@ -181,7 +181,6 @@ struct App {
     status: String,
     running: bool,
     hit_zones: HitZones,
-    started_at: Instant,
 }
 
 impl App {
@@ -195,7 +194,6 @@ impl App {
             status: "Ready. Type a prompt or / for commands.".to_string(),
             running: true,
             hit_zones: HitZones::default(),
-            started_at: Instant::now(),
         }
     }
 
@@ -347,6 +345,14 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         app.running = false;
         return;
     }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
+        app.running = false;
+        return;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+        app.open_alpha();
+        return;
+    }
 
     match key.code {
         KeyCode::Esc => {
@@ -388,14 +394,6 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         KeyCode::Backspace => {
             app.input.pop();
             app.clamp_slash_selection();
-        }
-        KeyCode::Char('u') if app.input.is_empty() => app.open_alpha(),
-        KeyCode::Char(ch) if app.input.is_empty() => {
-            if let Some(index) = HOME_MENU.iter().position(|item| item.key == ch.to_string()) {
-                app.run_menu_action(HOME_MENU[index].action);
-            } else {
-                app.input.push(ch);
-            }
         }
         KeyCode::Char(ch) => {
             app.input.push(ch);
@@ -480,23 +478,7 @@ fn render_top_bar(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         Span::raw("  "),
         Span::styled(collapse_home(&app.cwd), Style::default().fg(theme.dim)),
     ]);
-    let right = format!("{PRODUCT} v{VERSION}");
     frame.render_widget(Paragraph::new(left), area);
-    let right_width = right.width() as u16;
-    if right_width < area.width {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                right,
-                Style::default().fg(theme.muted),
-            ))),
-            Rect {
-                x: area.right().saturating_sub(right_width + 1),
-                y: area.y,
-                width: right_width,
-                height: 1,
-            },
-        );
-    }
 }
 
 fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, zones: &mut HitZones) {
@@ -563,7 +545,7 @@ fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, zone
         ),
         Span::styled("  ", Style::default()),
         Span::styled(ALPHA_URL, Style::default().fg(theme.muted)),
-        Span::styled("  press u", Style::default().fg(theme.dim)),
+        Span::styled("  Ctrl+U", Style::default().fg(theme.dim)),
     ]);
     frame.render_widget(Paragraph::new(cta_line), cta);
     zones.alpha = Some(Rect {
@@ -634,11 +616,9 @@ fn render_menu_rows(
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
-    let elapsed = app.started_at.elapsed().as_secs();
     let line = Line::from(vec![
         Span::styled("● ", Style::default().fg(theme.accent)),
         Span::styled(&app.status, Style::default().fg(theme.muted)),
-        Span::styled(format!("  {elapsed}s"), Style::default().fg(theme.dim)),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
