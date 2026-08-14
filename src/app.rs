@@ -947,7 +947,7 @@ impl App {
         let elapsed = format_elapsed(turn.started_at.elapsed().as_millis());
         let message = match outcome {
             RunOutcome::Completed => {
-                let verb = if run_id % 2 == 0 {
+                let verb = if run_id.is_multiple_of(2) {
                     "Delegated"
                 } else {
                     "Worked"
