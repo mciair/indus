@@ -47,13 +47,14 @@ const DEFAULT_MAX_RETRIES: u16 = 3;
 const DEFAULT_RETRY_DELAY_MS: u64 = 2_000;
 const MAX_RETRY_DELAY_MS: u64 = 30_000;
 const DOOM_LOOP_THRESHOLD: usize = 3;
+const DEFAULT_COMPACTION_THRESHOLD_PERCENT: u8 = 85;
 
 #[derive(Clone, Debug)]
 pub struct HarnessConfig {
     pub system: Vec<String>,
     pub max_steps: usize,
     pub max_retries: u16,
-    pub compaction_token_limit: Option<u64>,
+    pub compaction_threshold_percent: u8,
     pub classify_prompts: bool,
 }
 
@@ -63,7 +64,7 @@ impl Default for HarnessConfig {
             system: Vec::new(),
             max_steps: DEFAULT_MAX_STEPS,
             max_retries: DEFAULT_MAX_RETRIES,
-            compaction_token_limit: None,
+            compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
             classify_prompts: false,
         }
     }
@@ -139,7 +140,6 @@ impl Harness {
             permissions,
             config: HarnessConfig {
                 system: vec![default_system_prompt()],
-                compaction_token_limit: Some(100_000),
                 classify_prompts: true,
                 ..HarnessConfig::default()
             },
@@ -492,14 +492,7 @@ impl Runtime {
             if blocked {
                 return self.finish(run_id, RunOutcome::Failed);
             }
-            if self.config.compaction_token_limit.is_some_and(|limit| {
-                self.session
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .total_usage()
-                    >= limit
-            }) && !self.compact(run_id)
-            {
+            if self.should_compact() && !self.compact(run_id) {
                 self.emit(HarnessEvent::CompactionRequired { run_id });
                 return self.finish(run_id, RunOutcome::CompactionRequired);
             }
@@ -754,6 +747,21 @@ impl Runtime {
         true
     }
 
+    fn should_compact(&self) -> bool {
+        let Some(threshold) = context_compaction_threshold(
+            self.transport.context_window(),
+            self.config.compaction_threshold_percent,
+        ) else {
+            return false;
+        };
+        let context_tokens = self
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .current_context_tokens();
+        context_tokens > 0 && context_tokens >= threshold
+    }
+
     fn wait_or_cancel(&self, milliseconds: u64) -> Result<(), TransportError> {
         let mut remaining = milliseconds;
         while remaining > 0 {
@@ -784,6 +792,15 @@ impl Runtime {
         self.emit(HarnessEvent::RunFinished { run_id, outcome });
         outcome
     }
+}
+
+fn context_compaction_threshold(context_window: Option<u64>, percent: u8) -> Option<u64> {
+    let context_window = context_window.filter(|window| *window > 0)?;
+    if percent == 0 || percent > 100 {
+        return None;
+    }
+    let threshold = (u128::from(context_window) * u128::from(percent)).div_ceil(100);
+    Some(threshold.min(u128::from(u64::MAX)) as u64)
 }
 
 fn default_permission_rules() -> Vec<PermissionRule> {
@@ -1084,5 +1101,15 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn compaction_threshold_is_exactly_eighty_five_percent() {
+        assert_eq!(
+            context_compaction_threshold(Some(200_000), 85),
+            Some(170_000)
+        );
+        assert_eq!(context_compaction_threshold(None, 85), None);
+        assert_eq!(context_compaction_threshold(Some(200_000), 0), None);
     }
 }
