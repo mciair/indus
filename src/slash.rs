@@ -126,14 +126,7 @@ pub static COMMANDS: &[SlashCommand] = &[
     SlashCommand::plain("edit-prompt", "Edit the previous prompt", "/edit-prompt"),
     SlashCommand::plain("expand", "Expand the current response", "/expand"),
     SlashCommand::plain("context", "Show loaded project context", "/context"),
-    SlashCommand::with_args(
-        "model",
-        "Change the active model",
-        "/model <name>",
-        "<model>",
-        true,
-        ArgumentSource::None,
-    ),
+    SlashCommand::plain("model", "Open the provider and model catalog", "/model"),
     SlashCommand::with_args(
         "effort",
         "Set reasoning effort",
