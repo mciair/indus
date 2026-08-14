@@ -79,6 +79,8 @@ pub struct ModelSelection {
     pub provider: ProviderId,
     pub model_id: String,
     pub model_name: String,
+    #[serde(default)]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -161,8 +163,19 @@ impl ProviderStore {
             provider,
             model_id: model.id.clone(),
             model_name: model.name.clone(),
+            context_window: model.context_window,
         });
         self.persist()
+    }
+
+    pub fn active_context_window(&self) -> Option<u64> {
+        let active = self.catalog.active.as_ref()?;
+        active.context_window.or_else(|| {
+            self.cached_models(active.provider)
+                .iter()
+                .find(|model| model.id == active.model_id)
+                .and_then(|model| model.context_window)
+        })
     }
 
     fn persist(&self) -> io::Result<()> {
@@ -683,7 +696,7 @@ mod tests {
             id: "model-one".into(),
             name: "Model One".into(),
             description: String::new(),
-            context_window: None,
+            context_window: Some(200_000),
             supports_tools: Some(true),
         };
         let mut store = ProviderStore::at(path.clone());
@@ -705,6 +718,7 @@ mod tests {
             Some("model-one")
         );
         assert_eq!(reloaded.cached_models(ProviderId::Anthropic), &[model]);
+        assert_eq!(reloaded.active_context_window(), Some(200_000));
 
         fs::remove_file(path).unwrap();
         fs::remove_dir(root).unwrap();
