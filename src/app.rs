@@ -197,24 +197,28 @@ pub enum ToolVisualState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TurnActivity {
+    Classifying,
     WaitingForResponse,
     Thinking,
     Responding,
     RunningTool(String),
     Retrying(u16),
     WaitingForPermission,
+    RunningJob(String),
     Cancelling,
 }
 
 impl TurnActivity {
     pub fn label(&self) -> String {
         match self {
+            Self::Classifying => "Classifying…".to_string(),
             Self::WaitingForResponse => "Waiting for response…".to_string(),
             Self::Thinking => "Thinking…".to_string(),
             Self::Responding => "Responding…".to_string(),
             Self::RunningTool(tool) => format!("Run {tool}"),
             Self::Retrying(attempt) => format!("Retrying (attempt {attempt})…"),
             Self::WaitingForPermission => "Waiting for permission…".to_string(),
+            Self::RunningJob(name) => format!("Running Job: {name}"),
             Self::Cancelling => "Cancelling…".to_string(),
         }
     }
@@ -680,6 +684,42 @@ impl App {
                     turn.set_activity(TurnActivity::WaitingForResponse);
                 }
             }
+            HarnessEvent::ClassifierStarted { .. } => {
+                self.set_turn_activity(TurnActivity::Classifying);
+            }
+            HarnessEvent::ClassifierFinished { .. } => {
+                self.set_turn_activity(TurnActivity::WaitingForResponse);
+            }
+            HarnessEvent::JobScheduled {
+                job_id,
+                name,
+                schedule,
+                ..
+            } => self.transcript.push(TranscriptEntry::Event(format!(
+                "Job {job_id}: {name} ({schedule})"
+            ))),
+            HarnessEvent::JobRunStarted {
+                run_id,
+                job_id,
+                name,
+            } => {
+                let mut turn = ActiveTurn::new();
+                turn.run_id = Some(run_id);
+                turn.set_activity(TurnActivity::RunningJob(name.clone()));
+                self.turn = Some(turn);
+                self.transcript.push(TranscriptEntry::Event(format!(
+                    "Job {job_id} started: {name}"
+                )));
+            }
+            HarnessEvent::JobRunFinished {
+                job_id,
+                name,
+                succeeded,
+                ..
+            } => self.transcript.push(TranscriptEntry::Event(format!(
+                "Job {job_id} {}: {name}",
+                if succeeded { "completed" } else { "failed" }
+            ))),
             HarnessEvent::WaitingForResponse { .. } => {
                 self.set_turn_activity(TurnActivity::WaitingForResponse)
             }
@@ -904,6 +944,7 @@ impl App {
                 };
                 format!("{verb} for {elapsed}")
             }
+            RunOutcome::Scheduled => format!("Scheduled in {elapsed}"),
             RunOutcome::Cancelled => format!("Turn cancelled by user in {elapsed}."),
             RunOutcome::Failed => format!("Turn failed in {elapsed}."),
             RunOutcome::CompactionRequired => format!("Paused for compaction after {elapsed}."),
