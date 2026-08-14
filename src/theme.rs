@@ -68,6 +68,7 @@ impl ThemeKind {
 }
 
 /// Complete semantic palette for conversation, execution, and diff rendering.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct Theme {
     pub bg_base: Color,
