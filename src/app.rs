@@ -1,4 +1,8 @@
-use std::{ops::Range, path::PathBuf, time::Instant};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use ratatui::layout::Rect;
 
@@ -232,6 +236,7 @@ impl App {
         let theme_kind = std::env::var("INDUS_THEME")
             .ok()
             .and_then(|name| ThemeKind::from_name(&name))
+            .or_else(load_theme_preference)
             .unwrap_or_default();
         Self {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -473,7 +478,9 @@ impl App {
         };
 
         if command.arguments_required && args.is_empty() {
-            return false;
+            self.transcript
+                .push(TranscriptEntry::Event(format!("Usage: {}", command.usage)));
+            return true;
         }
 
         match command.name {
@@ -492,14 +499,14 @@ impl App {
                 } else if let Some(kind) = ThemeKind::from_name(args) {
                     kind
                 } else {
-                    return false;
+                    self.transcript.push(TranscriptEntry::Event(format!(
+                        "Unknown theme: {args}. Available: auto, indus-night, indusday, indus-midnight, indus-warm."
+                    )));
+                    return true;
                 };
                 self.theme_kind = next;
                 self.preview_theme = None;
-                self.transcript.push(TranscriptEntry::Event(format!(
-                    "Theme changed to {}.",
-                    next.name()
-                )));
+                persist_theme_preference(next);
             }
             "help" => self.transcript.push(TranscriptEntry::Event(
                 "Type / to browse commands. Use Tab to complete and Enter to run.".to_string(),
@@ -509,6 +516,31 @@ impl App {
                 .push(TranscriptEntry::Event(command.usage.to_string())),
         }
         true
+    }
+}
+
+fn theme_config_path() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")))
+        .map(|root| root.join("indus").join("theme"))
+}
+
+fn load_theme_preference() -> Option<ThemeKind> {
+    let path = theme_config_path()?;
+    let value = std::fs::read_to_string(path).ok()?;
+    ThemeKind::from_name(&value)
+}
+
+fn persist_theme_preference(kind: ThemeKind) {
+    let Some(path) = theme_config_path() else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_ok() {
+        let _ = std::fs::write(path, kind.name());
     }
 }
 
