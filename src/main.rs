@@ -1,5 +1,6 @@
 mod app;
 pub mod harness;
+mod provider;
 mod slash;
 mod theme;
 mod ui;
@@ -41,6 +42,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::new();
     let harness = Harness::provider_neutral();
     while app.running {
+        app.process_model_discovery();
         for event in harness.drain_events() {
             app.apply_harness_event(event);
         }
@@ -68,6 +70,10 @@ fn handle_key(app: &mut App, harness: &Harness, key: KeyEvent) {
     }
     if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('u') {
         open_alpha();
+        return;
+    }
+    if app.catalog_modal.is_some() {
+        handle_catalog_key(app, key);
         return;
     }
     if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('e') {
@@ -142,6 +148,45 @@ fn handle_key(app: &mut App, harness: &Harness, key: KeyEvent) {
     }
 }
 
+fn handle_catalog_key(app: &mut App, key: KeyEvent) {
+    if matches!(app.catalog_modal, Some(app::CatalogModal::ApiKey { .. })) {
+        match key.code {
+            KeyCode::Esc => app.close_catalog_level(),
+            KeyCode::Enter if key.modifiers.is_empty() => app.submit_catalog_selection(),
+            KeyCode::Backspace => app.edit_api_key(|input| input.backspace()),
+            KeyCode::Delete => app.edit_api_key(|input| input.delete()),
+            KeyCode::Left => app.edit_api_key(|input| input.move_left()),
+            KeyCode::Right => app.edit_api_key(|input| input.move_right()),
+            KeyCode::Home => app.edit_api_key(|input| input.move_home()),
+            KeyCode::End => app.edit_api_key(|input| input.move_end()),
+            KeyCode::Char(ch)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                app.edit_api_key(|input| input.insert_char(ch));
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc => app.close_catalog_level(),
+        KeyCode::Up => app.move_catalog_selection(-1),
+        KeyCode::Down => app.move_catalog_selection(1),
+        KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+            app.move_catalog_selection(-1)
+        }
+        KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
+            app.move_catalog_selection(1)
+        }
+        KeyCode::Enter if key.modifiers.is_empty() => app.submit_catalog_selection(),
+        KeyCode::Char('r') if key.modifiers.is_empty() => app.refresh_model_catalog(),
+        KeyCode::Char('k') if key.modifiers.is_empty() => app.replace_provider_key(),
+        _ => {}
+    }
+}
+
 fn handle_slash_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Up => {
@@ -191,6 +236,18 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     }
     let x = mouse.column;
     let y = mouse.row;
+    if app.catalog_modal.is_some() {
+        let catalog_hit = app
+            .hit_zones
+            .catalog_rows
+            .iter()
+            .find_map(|(area, index)| contains(*area, x, y).then_some(*index));
+        if let Some(index) = catalog_hit {
+            app.select_catalog_index(index);
+            app.submit_catalog_selection();
+        }
+        return;
+    }
     if app.hit_zones.alpha.is_some_and(|area| contains(area, x, y)) {
         open_alpha();
         return;
