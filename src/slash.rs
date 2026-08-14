@@ -371,19 +371,6 @@ impl SlashMenu {
         }
         self.selected = (self.selected as isize + delta).rem_euclid(len as isize) as usize;
     }
-
-    pub fn selected_command(&self) -> Option<SlashCommand> {
-        match self.phase {
-            CompletionPhase::Command => self.selection().and_then(|row| {
-                let name = row.display.trim_start_matches('/');
-                COMMANDS
-                    .iter()
-                    .copied()
-                    .find(|command| command.name == name)
-            }),
-            CompletionPhase::Arguments { command_index } => COMMANDS.get(command_index).copied(),
-        }
-    }
 }
 
 struct ParsedSlash {
