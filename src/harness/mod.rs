@@ -855,7 +855,7 @@ fn persistent_job_prompt(job: &Job) -> String {
         "## Execution Contract".to_string(),
         "Execute one useful scheduled run now. Inspect current state, perform the requested work, verify the result, and return a concise run summary.".to_string(),
         "Do not assume access to the original conversation beyond this brief. If a required decision is missing, state the blocker and the exact question.".to_string(),
-        "Persist outputs in the repository or destination named by the goal. Do not create or use Tricks.".to_string(),
+        "Persist outputs in the repository or destination named by the goal.".to_string(),
     ]
     .join("\n")
 }
