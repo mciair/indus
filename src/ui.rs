@@ -11,7 +11,8 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    app::{App, HOME_MENU, HitZones, TranscriptEntry, TurnActivity},
+    app::{App, HOME_MENU, HitZones, ToolVisualState, TranscriptEntry, TurnActivity},
+    harness::event::{DiffKind, FileDiff},
     theme::Theme,
 };
 
@@ -28,7 +29,11 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     let prompt_width = area.width.saturating_sub(4).max(4);
     let prompt_height = composer_height(app.composer.text(), prompt_width.saturating_sub(8));
-    let turn_height = u16::from(app.turn.is_some());
+    let turn_height = if app.permission.is_some() {
+        3
+    } else {
+        u16::from(app.turn.is_some())
+    };
     let prompt_gap = u16::from(turn_height == 0 && area.height > 16);
     let [top, body, _, turn, prompt] = Layout::vertical([
         Constraint::Length(2),
@@ -61,7 +66,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     if app.transcript.is_empty() {
         render_home(frame, content, app, &theme, &mut zones);
     } else {
-        render_transcript(frame, content, app, &theme);
+        render_transcript(frame, content, app, &theme, &mut zones);
     }
     if app.turn.is_some() {
         render_turn_status(frame, turn, app, &theme);
@@ -219,14 +224,21 @@ fn render_menu(
 struct TranscriptRow {
     line: Line<'static>,
     background: Color,
+    fold_entry: Option<usize>,
 }
 
-fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+fn render_transcript(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    zones: &mut HitZones,
+) {
     fill(frame.buffer_mut(), area, theme.base());
     let mut rows = Vec::new();
     let width = area.width.max(1) as usize;
-    for entry in &app.transcript {
-        build_transcript_rows(&mut rows, entry, width, theme);
+    for (index, entry) in app.transcript.iter().enumerate() {
+        build_transcript_rows(&mut rows, index, entry, width, theme);
     }
     let visible = area.height as usize;
     let start = rows.len().saturating_sub(visible);
@@ -238,11 +250,15 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
             Style::default().bg(row.background),
         );
         frame.render_widget(Paragraph::new(row.line), target);
+        if let Some(index) = row.fold_entry {
+            zones.fold_rows.push((target, index));
+        }
     }
 }
 
 fn build_transcript_rows(
     rows: &mut Vec<TranscriptRow>,
+    entry_index: usize,
     entry: &TranscriptEntry,
     width: usize,
     theme: &Theme,
@@ -277,13 +293,16 @@ fn build_transcript_rows(
                 rows.push(TranscriptRow {
                     line: Line::from(spans),
                     background: theme.bg_light,
+                    fold_entry: None,
                 });
             }
             rows.push(blank_row(theme.bg_light));
         }
         TranscriptEntry::Thinking {
+            text,
             running,
             elapsed_ms,
+            expanded,
             ..
         } => {
             let label = if *running {
@@ -293,16 +312,47 @@ fn build_transcript_rows(
             } else {
                 "Thought".to_string()
             };
+            let bullet = if *running {
+                theme.accent_thinking
+            } else {
+                theme.gray
+            };
+            let mut spans = vec![
+                Span::styled("● ", Style::default().fg(bullet)),
+                Span::styled(
+                    label,
+                    Style::default().fg(theme.gray).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if !*expanded && !*running {
+                spans.push(Span::styled(
+                    "  (ctrl+e to expand)",
+                    Style::default().fg(theme.gray_dim),
+                ));
+            }
             rows.push(TranscriptRow {
-                line: Line::from(vec![
-                    Span::styled("● ", Style::default().fg(theme.accent_thinking)),
-                    Span::styled(
-                        label,
-                        Style::default().fg(theme.gray).add_modifier(Modifier::BOLD),
-                    ),
-                ]),
+                line: Line::from(spans),
                 background: theme.bg_base,
+                fold_entry: Some(entry_index),
             });
+            if *expanded && !text.is_empty() {
+                rows.push(foldable_blank_row(theme.bg_base, entry_index));
+                for segment in wrap_text(text, width.saturating_sub(2).max(1)) {
+                    rows.push(TranscriptRow {
+                        line: Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(
+                                segment,
+                                Style::default()
+                                    .fg(theme.text_secondary)
+                                    .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                            ),
+                        ]),
+                        background: theme.bg_base,
+                        fold_entry: Some(entry_index),
+                    });
+                }
+            }
         }
         TranscriptEntry::Assistant { text, .. } => {
             for segment in wrap_text(text, width.saturating_sub(2).max(1)) {
@@ -312,7 +362,109 @@ fn build_transcript_rows(
                         Span::styled(segment, Style::default().fg(theme.text_primary)),
                     ]),
                     background: theme.bg_base,
+                    fold_entry: None,
                 });
+            }
+        }
+        TranscriptEntry::Tool {
+            name,
+            description,
+            input,
+            output,
+            state,
+            expanded,
+            diffs,
+            ..
+        } => {
+            let accent = match state {
+                ToolVisualState::Running => theme.accent_thinking,
+                ToolVisualState::Succeeded => theme.accent_success,
+                ToolVisualState::Failed(_) => theme.accent_error,
+            };
+            let (insertions, deletions) = diff_counts(diffs);
+            let mut header = vec![Span::styled("● ", Style::default().fg(accent))];
+            if diffs.is_empty() {
+                let title = run_title(name, description, input);
+                header.push(Span::styled(
+                    "Run ",
+                    Style::default()
+                        .fg(theme.text_primary)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                header.push(Span::styled(title, Style::default().fg(theme.text_primary)));
+            } else {
+                let target = if diffs.len() == 1 {
+                    diffs[0].path.clone()
+                } else {
+                    format!("{} files", diffs.len())
+                };
+                header.push(Span::styled(
+                    "Edit ",
+                    Style::default()
+                        .fg(theme.text_primary)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                header.push(Span::styled(
+                    target,
+                    Style::default().fg(theme.accent_skill),
+                ));
+                header.push(Span::styled(
+                    format!(" +{insertions}"),
+                    Style::default().fg(theme.diff_insert_fg),
+                ));
+                header.push(Span::styled("/", Style::default().fg(theme.gray_dim)));
+                header.push(Span::styled(
+                    format!("-{deletions}"),
+                    Style::default().fg(theme.diff_delete_fg),
+                ));
+            }
+            rows.push(TranscriptRow {
+                line: Line::from(header),
+                background: theme.bg_base,
+                fold_entry: Some(entry_index),
+            });
+            if *expanded {
+                if !input.trim().is_empty() && diffs.is_empty() {
+                    for (line_index, segment) in wrap_text(input, width.saturating_sub(4).max(1))
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let prefix = if line_index == 0 { "  $ " } else { "    " };
+                        rows.push(TranscriptRow {
+                            line: Line::from(vec![
+                                Span::styled(prefix, Style::default().fg(theme.gray_dim)),
+                                Span::styled(segment, Style::default().fg(theme.command)),
+                            ]),
+                            background: theme.bg_base,
+                            fold_entry: Some(entry_index),
+                        });
+                    }
+                }
+                if !output.trim().is_empty() {
+                    for segment in wrap_text(output, width.saturating_sub(4).max(1)) {
+                        rows.push(TranscriptRow {
+                            line: Line::from(vec![
+                                Span::raw("    "),
+                                Span::styled(segment, Style::default().fg(theme.text_secondary)),
+                            ]),
+                            background: theme.bg_base,
+                            fold_entry: Some(entry_index),
+                        });
+                    }
+                }
+                if let ToolVisualState::Failed(message) = state {
+                    for segment in wrap_text(message, width.saturating_sub(4).max(1)) {
+                        rows.push(TranscriptRow {
+                            line: Line::from(vec![
+                                Span::raw("    "),
+                                Span::styled(segment, Style::default().fg(theme.accent_error)),
+                            ]),
+                            background: theme.bg_base,
+                            fold_entry: Some(entry_index),
+                        });
+                    }
+                }
+                render_file_diffs(rows, diffs, width, entry_index, theme);
             }
         }
         TranscriptEntry::Event(text) => {
@@ -325,6 +477,7 @@ fn build_transcript_rows(
                     Span::styled(text.clone(), Style::default().fg(theme.gray)),
                 ]),
                 background: theme.bg_base,
+                fold_entry: None,
             });
         }
     }
@@ -334,6 +487,115 @@ fn blank_row(background: Color) -> TranscriptRow {
     TranscriptRow {
         line: Line::default(),
         background,
+        fold_entry: None,
+    }
+}
+
+fn foldable_blank_row(background: Color, entry_index: usize) -> TranscriptRow {
+    TranscriptRow {
+        line: Line::default(),
+        background,
+        fold_entry: Some(entry_index),
+    }
+}
+
+fn run_title(name: &str, description: &str, input: &str) -> String {
+    let description = description.trim().replace('\n', " ");
+    let lower = description.to_ascii_lowercase();
+    let description = if let Some(rest) = lower.strip_prefix("running ") {
+        description[description.len() - rest.len()..].trim()
+    } else if let Some(rest) = lower.strip_prefix("run ") {
+        description[description.len() - rest.len()..].trim()
+    } else {
+        description.as_str()
+    };
+    if !description.is_empty() {
+        description.to_string()
+    } else if !input.trim().is_empty() {
+        input.trim().replace('\n', " ")
+    } else if !name.trim().is_empty() {
+        name.to_string()
+    } else {
+        "…".to_string()
+    }
+}
+
+fn diff_counts(diffs: &[FileDiff]) -> (usize, usize) {
+    diffs
+        .iter()
+        .flat_map(|diff| &diff.lines)
+        .fold((0, 0), |(added, removed), line| match line.kind {
+            DiffKind::Added => (added + 1, removed),
+            DiffKind::Removed => (added, removed + 1),
+            DiffKind::Context => (added, removed),
+        })
+}
+
+fn render_file_diffs(
+    rows: &mut Vec<TranscriptRow>,
+    diffs: &[FileDiff],
+    width: usize,
+    entry_index: usize,
+    theme: &Theme,
+) {
+    for diff in diffs {
+        rows.push(foldable_blank_row(theme.bg_base, entry_index));
+        rows.push(TranscriptRow {
+            line: Line::from(vec![
+                Span::styled("  Edit ", Style::default().fg(theme.gray)),
+                Span::styled(
+                    diff.path.clone(),
+                    Style::default()
+                        .fg(theme.accent_skill)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            background: theme.bg_base,
+            fold_entry: Some(entry_index),
+        });
+
+        let line_width = diff
+            .lines
+            .iter()
+            .flat_map(|line| [line.old_line, line.new_line])
+            .flatten()
+            .max()
+            .unwrap_or(0)
+            .to_string()
+            .len()
+            .max(1);
+        let gutter_width = 2 + line_width * 2 + 3;
+        let content_width = width.saturating_sub(gutter_width).max(1);
+        for line in &diff.lines {
+            let old = line.old_line.map_or_else(
+                || " ".repeat(line_width),
+                |value| format!("{value:>line_width$}"),
+            );
+            let new = line.new_line.map_or_else(
+                || " ".repeat(line_width),
+                |value| format!("{value:>line_width$}"),
+            );
+            let (foreground, background) = match line.kind {
+                DiffKind::Context => (theme.diff_equal_fg, theme.bg_base),
+                DiffKind::Added => (theme.diff_insert_fg, theme.diff_insert_bg),
+                DiffKind::Removed => (theme.diff_delete_fg, theme.diff_delete_bg),
+            };
+            rows.push(TranscriptRow {
+                line: Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(old, Style::default().fg(theme.diff_gutter_fg)),
+                    Span::raw(" "),
+                    Span::styled(new, Style::default().fg(theme.diff_gutter_fg)),
+                    Span::raw("  "),
+                    Span::styled(
+                        truncate(line.text.trim_end_matches(['\r', '\n']), content_width),
+                        Style::default().fg(foreground).bg(background),
+                    ),
+                ]),
+                background,
+                fold_entry: Some(entry_index),
+            });
+        }
     }
 }
 
@@ -375,12 +637,48 @@ fn render_turn_status(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Them
         return;
     };
     fill(frame.buffer_mut(), area, theme.base());
+    if let Some(permission) = &app.permission {
+        let description = truncate(
+            &permission.description,
+            area.width.saturating_sub(2) as usize,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("◆ ", Style::default().fg(theme.warning)),
+                Span::styled(
+                    description,
+                    Style::default()
+                        .fg(theme.text_primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        let pattern = permission.patterns.join(", ");
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                truncate(&pattern, area.width.saturating_sub(2) as usize),
+                Style::default().fg(theme.gray),
+            )),
+            Rect::new(area.x + 2, area.y + 1, area.width.saturating_sub(2), 1),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("[y] once", Style::default().fg(theme.accent_success)),
+                Span::styled("  [a] always", Style::default().fg(theme.accent_skill)),
+                Span::styled("  [n] reject", Style::default().fg(theme.accent_error)),
+            ])),
+            Rect::new(area.x + 2, area.y + 2, area.width.saturating_sub(2), 1),
+        );
+        return;
+    }
     let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let spinner = frames[(app.animation_tick as usize / 2) % frames.len()];
     let activity_color = match turn.activity {
         TurnActivity::RunningTool(_) => theme.accent_success,
         TurnActivity::Retrying(_) => theme.warning,
         TurnActivity::Cancelling => theme.accent_error,
+        TurnActivity::WaitingForPermission => theme.warning,
         TurnActivity::Thinking | TurnActivity::Responding | TurnActivity::WaitingForResponse => {
             theme.text_secondary
         }
