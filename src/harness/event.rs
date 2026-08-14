@@ -3,6 +3,7 @@
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RunOutcome {
     Completed,
+    Scheduled,
     Cancelled,
     Failed,
     CompactionRequired,
@@ -41,6 +42,31 @@ pub struct FileDiff {
 pub enum HarnessEvent {
     RunStarted {
         run_id: u64,
+    },
+    ClassifierStarted {
+        run_id: u64,
+    },
+    ClassifierFinished {
+        run_id: u64,
+        category: String,
+        description: String,
+    },
+    JobScheduled {
+        run_id: u64,
+        job_id: String,
+        name: String,
+        schedule: String,
+    },
+    JobRunStarted {
+        run_id: u64,
+        job_id: String,
+        name: String,
+    },
+    JobRunFinished {
+        run_id: u64,
+        job_id: String,
+        name: String,
+        succeeded: bool,
     },
     WaitingForResponse {
         run_id: u64,
