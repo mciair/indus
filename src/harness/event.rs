@@ -16,6 +16,27 @@ pub enum PermissionReply {
     Reject,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiffKind {
+    Context,
+    Added,
+    Removed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiffLine {
+    pub old_line: Option<usize>,
+    pub new_line: Option<usize>,
+    pub kind: DiffKind,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileDiff {
+    pub path: String,
+    pub lines: Vec<DiffLine>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HarnessEvent {
     RunStarted {
@@ -54,13 +75,21 @@ pub enum HarnessEvent {
         run_id: u64,
         call_id: String,
         name: String,
+        description: String,
         input: String,
+    },
+    ToolOutput {
+        run_id: u64,
+        call_id: String,
+        text: String,
     },
     ToolFinished {
         run_id: u64,
         call_id: String,
         name: String,
         title: String,
+        output: String,
+        diffs: Vec<FileDiff>,
     },
     ToolFailed {
         run_id: u64,
