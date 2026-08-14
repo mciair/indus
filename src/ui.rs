@@ -1,0 +1,874 @@
+use std::{path::Path, process::Command};
+
+use ratatui::{
+    Frame,
+    buffer::Buffer,
+    layout::{Constraint, Flex, Layout, Margin, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::{
+    app::{App, HOME_MENU, HitZones, TranscriptEntry, TurnActivity},
+    theme::Theme,
+};
+
+const PRODUCT: &str = "Indus";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const ALPHA_LABEL: &str = "Meet Alpha: Where Ideas Diverge";
+pub const ALPHA_URL: &str = "https://mciair.in/hc";
+const MAX_SLASH_ROWS: usize = 6;
+
+pub fn render(frame: &mut Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    let theme = Theme::for_preference(app.effective_theme_kind());
+    frame.render_widget(Block::default().style(theme.base()), area);
+
+    let prompt_width = area.width.saturating_sub(4).max(4);
+    let prompt_height = composer_height(app.composer.text(), prompt_width.saturating_sub(8));
+    let turn_height = u16::from(app.turn.is_some());
+    let prompt_gap = u16::from(turn_height == 0 && area.height > 16);
+    let [top, body, _, turn, prompt] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(4),
+        Constraint::Length(prompt_gap),
+        Constraint::Length(turn_height),
+        Constraint::Length(prompt_height),
+    ])
+    .areas(area);
+
+    let [_, content, _] = Layout::horizontal([
+        Constraint::Length(2),
+        Constraint::Min(4),
+        Constraint::Length(2),
+    ])
+    .areas(body);
+    let prompt = Rect {
+        x: area.x + 2,
+        width: prompt_width,
+        ..prompt
+    };
+    let turn = Rect {
+        x: prompt.x + 2,
+        width: prompt.width.saturating_sub(4),
+        ..turn
+    };
+
+    let mut zones = HitZones::default();
+    render_top_bar(frame, top, app, &theme);
+    if app.transcript.is_empty() {
+        render_home(frame, content, app, &theme, &mut zones);
+    } else {
+        render_transcript(frame, content, app, &theme);
+    }
+    if app.turn.is_some() {
+        render_turn_status(frame, turn, app, &theme);
+    }
+    render_composer(frame, prompt, app, &theme);
+    if app.slash.open {
+        render_slash_dropdown(frame, prompt, app, &theme, &mut zones);
+    }
+    app.hit_zones = zones;
+}
+
+fn render_top_bar(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    let branch = current_branch().unwrap_or_else(|| "no git branch".to_string());
+    let line = Line::from(vec![
+        Span::styled(" ", Style::default().fg(theme.gray)),
+        Span::styled(branch, Style::default().fg(theme.text_secondary)),
+        Span::raw("  "),
+        Span::styled(collapse_home(&app.cwd), Style::default().fg(theme.gray_dim)),
+    ]);
+    frame.render_widget(Paragraph::new(line).style(theme.base()), area);
+}
+
+fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, zones: &mut HitZones) {
+    let width = area.width.saturating_sub(4).clamp(56, 104);
+    let height = 14u16.min(area.height.saturating_sub(1)).max(10);
+    let [_, vertical, _] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(height),
+        Constraint::Min(0),
+    ])
+    .flex(Flex::Center)
+    .areas(area);
+    let [_, card, _] = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(width.min(area.width)),
+        Constraint::Min(0),
+    ])
+    .flex(Flex::Center)
+    .areas(vertical);
+
+    frame.render_widget(Clear, card);
+    frame.render_widget(
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.prompt_border))
+            .style(Style::default().bg(theme.bg_base)),
+        card,
+    );
+
+    let inner = card.inner(Margin {
+        horizontal: 3,
+        vertical: 1,
+    });
+    let [heading, subtitle, cta, _, menu] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(HOME_MENU.len() as u16),
+    ])
+    .areas(inner);
+
+    let version = format!("v{VERSION}");
+    let title_gap = inner
+        .width
+        .saturating_sub(PRODUCT.width() as u16 + version.width() as u16);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                PRODUCT,
+                Style::default()
+                    .fg(theme.text_primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ".repeat(title_gap as usize), theme.base()),
+            Span::styled(version, Style::default().fg(theme.gray)),
+        ])),
+        heading,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "India's AI-native CLI",
+            Style::default().fg(theme.text_secondary),
+        )),
+        subtitle,
+    );
+
+    let cta_text = format!("[{ALPHA_LABEL}]");
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                cta_text.clone(),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  Ctrl+U", Style::default().fg(theme.gray_dim)),
+        ])),
+        cta,
+    );
+    zones.alpha = Some(Rect::new(cta.x, cta.y, cta_text.width() as u16, 1));
+    zones.menu = render_menu(frame, menu, app, theme);
+}
+
+fn render_menu(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+) -> Vec<(Rect, crate::app::MenuAction)> {
+    let row_width = 44u16.min(area.width);
+    let [_, rows_area, _] = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(row_width),
+        Constraint::Min(0),
+    ])
+    .flex(Flex::Center)
+    .areas(area);
+    let mut hit_rows = Vec::with_capacity(HOME_MENU.len());
+
+    for (index, item) in HOME_MENU.iter().enumerate() {
+        let row = Rect::new(rows_area.x, rows_area.y + index as u16, rows_area.width, 1);
+        let selected = index == app.selected_menu;
+        let bg = if selected {
+            theme.bg_visual
+        } else {
+            theme.bg_base
+        };
+        fill(frame.buffer_mut(), row, Style::default().bg(bg));
+        let key = format!("{} ", item.key);
+        let gap = row
+            .width
+            .saturating_sub(item.label.width() as u16 + key.width() as u16);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    item.label,
+                    Style::default()
+                        .fg(theme.text_primary)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ".repeat(gap as usize), Style::default().bg(bg)),
+                Span::styled(key, Style::default().fg(theme.gray_bright).bg(bg)),
+            ])),
+            row,
+        );
+        hit_rows.push((row, item.action));
+    }
+    hit_rows
+}
+
+#[derive(Clone)]
+struct TranscriptRow {
+    line: Line<'static>,
+    background: Color,
+}
+
+fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    fill(frame.buffer_mut(), area, theme.base());
+    let mut rows = Vec::new();
+    let width = area.width.max(1) as usize;
+    for entry in &app.transcript {
+        build_transcript_rows(&mut rows, entry, width, theme);
+    }
+    let visible = area.height as usize;
+    let start = rows.len().saturating_sub(visible);
+    for (offset, row) in rows.into_iter().skip(start).take(visible).enumerate() {
+        let target = Rect::new(area.x, area.y + offset as u16, area.width, 1);
+        fill(
+            frame.buffer_mut(),
+            target,
+            Style::default().bg(row.background),
+        );
+        frame.render_widget(Paragraph::new(row.line), target);
+    }
+}
+
+fn build_transcript_rows(
+    rows: &mut Vec<TranscriptRow>,
+    entry: &TranscriptEntry,
+    width: usize,
+    theme: &Theme,
+) {
+    match entry {
+        TranscriptEntry::User { text, slash_tokens } => {
+            if !rows.is_empty() {
+                rows.push(blank_row(theme.bg_base));
+            }
+            rows.push(blank_row(theme.bg_light));
+            let content_width = width.saturating_sub(4).max(1);
+            let wrapped = wrap_text(text, content_width);
+            for (line_index, segment) in wrapped.iter().enumerate() {
+                let prefix = if line_index == 0 { "❯ " } else { "  " };
+                let mut spans = vec![Span::styled(
+                    prefix.to_string(),
+                    Style::default().fg(theme.accent_user).bg(theme.bg_light),
+                )];
+                if slash_tokens.is_empty() || line_index > 0 {
+                    spans.push(Span::styled(
+                        segment.clone(),
+                        Style::default().fg(theme.text_primary).bg(theme.bg_light),
+                    ));
+                } else {
+                    spans.extend(highlight_slash_tokens(
+                        segment,
+                        slash_tokens,
+                        theme.bg_light,
+                        theme,
+                    ));
+                }
+                rows.push(TranscriptRow {
+                    line: Line::from(spans),
+                    background: theme.bg_light,
+                });
+            }
+            rows.push(blank_row(theme.bg_light));
+        }
+        TranscriptEntry::Thinking {
+            running,
+            elapsed_ms,
+            ..
+        } => {
+            let label = if *running {
+                "Thinking…".to_string()
+            } else if let Some(milliseconds) = elapsed_ms {
+                format!("Thought for {}", format_milliseconds(*milliseconds))
+            } else {
+                "Thought".to_string()
+            };
+            rows.push(TranscriptRow {
+                line: Line::from(vec![
+                    Span::styled("● ", Style::default().fg(theme.accent_thinking)),
+                    Span::styled(
+                        label,
+                        Style::default().fg(theme.gray).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                background: theme.bg_base,
+            });
+        }
+        TranscriptEntry::Assistant { text, .. } => {
+            for segment in wrap_text(text, width.saturating_sub(2).max(1)) {
+                rows.push(TranscriptRow {
+                    line: Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(segment, Style::default().fg(theme.text_primary)),
+                    ]),
+                    background: theme.bg_base,
+                });
+            }
+        }
+        TranscriptEntry::Event(text) => {
+            if !rows.is_empty() {
+                rows.push(blank_row(theme.bg_base));
+            }
+            rows.push(TranscriptRow {
+                line: Line::from(vec![
+                    Span::styled("● ", Style::default().fg(theme.gray_dim)),
+                    Span::styled(text.clone(), Style::default().fg(theme.gray)),
+                ]),
+                background: theme.bg_base,
+            });
+        }
+    }
+}
+
+fn blank_row(background: Color) -> TranscriptRow {
+    TranscriptRow {
+        line: Line::default(),
+        background,
+    }
+}
+
+fn highlight_slash_tokens(
+    line: &str,
+    ranges: &[std::ops::Range<usize>],
+    background: Color,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    for range in ranges {
+        if range.start >= line.len() || range.end > line.len() || range.start < cursor {
+            continue;
+        }
+        if range.start > cursor {
+            spans.push(Span::styled(
+                line[cursor..range.start].to_string(),
+                Style::default().fg(theme.text_primary).bg(background),
+            ));
+        }
+        spans.push(Span::styled(
+            line[range.clone()].to_string(),
+            Style::default().fg(theme.accent_skill).bg(background),
+        ));
+        cursor = range.end;
+    }
+    if cursor < line.len() {
+        spans.push(Span::styled(
+            line[cursor..].to_string(),
+            Style::default().fg(theme.text_primary).bg(background),
+        ));
+    }
+    spans
+}
+
+fn render_turn_status(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    let Some(turn) = &app.turn else {
+        return;
+    };
+    fill(frame.buffer_mut(), area, theme.base());
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let spinner = frames[(app.animation_tick as usize / 2) % frames.len()];
+    let activity_color = match turn.activity {
+        TurnActivity::RunningTool(_) => theme.accent_success,
+        TurnActivity::Retrying(_) => theme.warning,
+        TurnActivity::Cancelling => theme.accent_error,
+        TurnActivity::Thinking | TurnActivity::Responding | TurnActivity::WaitingForResponse => {
+            theme.text_secondary
+        }
+    };
+    let label = turn.activity.label();
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!("{spinner} "), Style::default().fg(activity_color)),
+            Span::styled(label, Style::default().fg(activity_color)),
+        ])),
+        area,
+    );
+    let stop = "[stop]";
+    if area.width > stop.width() as u16 + 4 {
+        frame.render_widget(
+            Paragraph::new(Line::styled(stop, Style::default().fg(theme.gray))),
+            Rect::new(
+                area.right().saturating_sub(stop.width() as u16),
+                area.y,
+                stop.width() as u16,
+                1,
+            ),
+        );
+    }
+}
+
+fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
+    fill(frame.buffer_mut(), area, theme.base());
+    let border = theme.prompt_border_active;
+    draw_horizontal_border(
+        frame.buffer_mut(),
+        area.x,
+        area.right(),
+        area.y,
+        '╭',
+        '╮',
+        border,
+        theme.bg_base,
+    );
+    let bottom = area.bottom() - 1;
+    draw_horizontal_border(
+        frame.buffer_mut(),
+        area.x,
+        area.right(),
+        bottom,
+        '╰',
+        '╯',
+        border,
+        theme.bg_base,
+    );
+    for y in area.y + 1..bottom {
+        set_cell(frame.buffer_mut(), area.x, y, '│', border, theme.bg_base);
+        set_cell(
+            frame.buffer_mut(),
+            area.right() - 1,
+            y,
+            '│',
+            border,
+            theme.bg_base,
+        );
+    }
+
+    let content = Rect::new(
+        area.x + 3,
+        area.y + 1,
+        area.width.saturating_sub(6),
+        area.height.saturating_sub(2),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled("❯ ", Style::default().fg(theme.accent_user))),
+        Rect::new(content.x, content.y, 2, 1),
+    );
+
+    let text_area = Rect::new(
+        content.x + 2,
+        content.y,
+        content.width.saturating_sub(2),
+        content.height,
+    );
+    let layout = layout_composer(app.composer.text(), app.composer.cursor(), text_area.width);
+    if app.composer.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "Build anything",
+                Style::default().fg(theme.gray_dim),
+            )),
+            text_area,
+        );
+    } else {
+        for (row, text) in layout.lines.iter().enumerate() {
+            if row >= text_area.height as usize {
+                break;
+            }
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    text.clone(),
+                    Style::default().fg(theme.text_primary),
+                )),
+                Rect::new(text_area.x, text_area.y + row as u16, text_area.width, 1),
+            );
+        }
+        paint_command_token(frame.buffer_mut(), text_area, app, theme, &layout);
+    }
+
+    if app.slash.argument_placeholder.is_some()
+        && app
+            .slash
+            .argument_range
+            .as_ref()
+            .is_some_and(|range| range.start == range.end)
+        && let Some(placeholder) = app.slash.argument_placeholder
+    {
+        let x = text_area.x + layout.cursor_column;
+        if x < text_area.right() {
+            frame.render_widget(
+                Paragraph::new(Line::styled(placeholder, Style::default().fg(theme.gray))),
+                Rect::new(
+                    x,
+                    text_area.y + layout.cursor_row,
+                    text_area.right().saturating_sub(x),
+                    1,
+                ),
+            );
+        }
+    }
+
+    let info = format!(" indus · {} ", app.theme_kind.name());
+    if info.width() + 4 < area.width as usize {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                info.clone(),
+                Style::default().fg(theme.gray).bg(theme.bg_base),
+            )),
+            Rect::new(area.x + 2, bottom, info.width() as u16, 1),
+        );
+    }
+
+    let cursor_x = text_area.x + layout.cursor_column;
+    let cursor_y = text_area.y + layout.cursor_row;
+    if cursor_x < text_area.right() && cursor_y < text_area.bottom() {
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
+}
+
+fn paint_command_token(
+    buffer: &mut Buffer,
+    text_area: Rect,
+    app: &App,
+    theme: &Theme,
+    layout: &ComposerLayout,
+) {
+    if !app.composer.text().starts_with('/') {
+        return;
+    }
+    let end = app
+        .composer
+        .text()
+        .find(char::is_whitespace)
+        .unwrap_or(app.composer.text().len());
+    for (byte, (row, column)) in &layout.positions {
+        if *byte >= end {
+            break;
+        }
+        if let Some(cell) = buffer.cell_mut((text_area.x + *column, text_area.y + *row)) {
+            cell.set_fg(theme.accent_skill);
+        }
+    }
+}
+
+fn render_slash_dropdown(
+    frame: &mut Frame<'_>,
+    prompt: Rect,
+    app: &App,
+    theme: &Theme,
+    zones: &mut HitZones,
+) {
+    let count = app.slash.suggestions.len();
+    let shown = count.saturating_sub(app.slash_scroll).min(MAX_SLASH_ROWS);
+    if shown == 0 {
+        return;
+    }
+    let height = shown as u16 + 2;
+    if prompt.y < height {
+        return;
+    }
+    let panel = Rect::new(prompt.x, prompt.y - height, prompt.width, height);
+    frame.render_widget(Clear, panel);
+    fill(
+        frame.buffer_mut(),
+        panel,
+        Style::default().bg(theme.bg_light),
+    );
+    let border_style = Style::default().fg(theme.bg_visual).bg(theme.bg_base);
+    frame.render_widget(
+        Paragraph::new(Line::styled("─".repeat(panel.width as usize), border_style)),
+        Rect::new(panel.x, panel.y, panel.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled("─".repeat(panel.width as usize), border_style)),
+        Rect::new(panel.x, panel.bottom() - 1, panel.width, 1),
+    );
+    let count_text = count.to_string();
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            count_text.clone(),
+            Style::default().fg(theme.gray).bg(theme.bg_base),
+        )),
+        Rect::new(
+            panel.right().saturating_sub(count_text.width() as u16 + 1),
+            panel.y,
+            count_text.width() as u16,
+            1,
+        ),
+    );
+
+    let row_width = panel.width.saturating_sub(2) as usize;
+    let label_width = (row_width * 3 / 5).min(40);
+    for (visible, (index, suggestion)) in app
+        .slash
+        .suggestions
+        .iter()
+        .enumerate()
+        .skip(app.slash_scroll)
+        .take(shown)
+        .enumerate()
+    {
+        let row = Rect::new(
+            panel.x + 1,
+            panel.y + 1 + visible as u16,
+            panel.width - 1,
+            1,
+        );
+        let selected = index == app.slash.selected;
+        let bg = if selected {
+            theme.bg_visual
+        } else {
+            theme.bg_light
+        };
+        fill(frame.buffer_mut(), row, Style::default().bg(bg));
+        let prefix = if selected { "❯ " } else { "  " };
+        let display = truncate(&suggestion.display, label_width);
+        let padding = label_width.saturating_sub(display.width()) + 2;
+        let description_width = row_width.saturating_sub(2 + label_width + 2);
+        let description = truncate(&suggestion.description, description_width);
+        let mut spans = vec![Span::styled(
+            prefix.to_string(),
+            Style::default().fg(theme.text_primary).bg(bg),
+        )];
+        spans.extend(highlighted_label(
+            &display,
+            &suggestion.matched_indices,
+            selected,
+            bg,
+            theme,
+        ));
+        spans.push(Span::styled(" ".repeat(padding), Style::default().bg(bg)));
+        spans.push(Span::styled(
+            description,
+            Style::default().fg(theme.gray).bg(bg),
+        ));
+        frame.render_widget(Paragraph::new(Line::from(spans)), row);
+        zones.slash_rows.push((row, index));
+    }
+}
+
+fn highlighted_label(
+    text: &str,
+    indices: &[usize],
+    selected: bool,
+    background: Color,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let modifier = if selected {
+        Modifier::BOLD
+    } else {
+        Modifier::empty()
+    };
+    for (index, ch) in text.chars().enumerate() {
+        let color = if indices.contains(&index) {
+            theme.fuzzy_accent
+        } else {
+            theme.text_primary
+        };
+        spans.push(Span::styled(
+            ch.to_string(),
+            Style::default()
+                .fg(color)
+                .bg(background)
+                .add_modifier(modifier),
+        ));
+    }
+    spans
+}
+
+struct ComposerLayout {
+    lines: Vec<String>,
+    cursor_row: u16,
+    cursor_column: u16,
+    positions: Vec<(usize, (u16, u16))>,
+}
+
+fn layout_composer(text: &str, cursor: usize, width: u16) -> ComposerLayout {
+    let width = width.max(1);
+    let mut lines = vec![String::new()];
+    let mut row = 0u16;
+    let mut column = 0u16;
+    let mut cursor_position = None;
+    let mut positions = Vec::new();
+
+    for (byte, ch) in text.char_indices() {
+        if byte == cursor {
+            cursor_position = Some((row, column));
+        }
+        if ch == '\n' {
+            row += 1;
+            column = 0;
+            lines.push(String::new());
+            continue;
+        }
+        let char_width = ch.width().unwrap_or(0) as u16;
+        if column > 0 && column + char_width > width {
+            row += 1;
+            column = 0;
+            lines.push(String::new());
+        }
+        positions.push((byte, (row, column)));
+        lines[row as usize].push(ch);
+        column += char_width;
+    }
+    let (cursor_row, cursor_column) = cursor_position.unwrap_or((row, column));
+    ComposerLayout {
+        lines,
+        cursor_row,
+        cursor_column,
+        positions,
+    }
+}
+
+fn composer_height(text: &str, width: u16) -> u16 {
+    let rows = layout_composer(text, text.len(), width).lines.len() as u16;
+    rows.clamp(1, 5) + 2
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let mut output = Vec::new();
+    for logical in text.lines() {
+        if logical.is_empty() {
+            output.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        for word in logical.split_inclusive(char::is_whitespace) {
+            if !current.is_empty() && current.width() + word.width() > width {
+                output.push(current.trim_end().to_string());
+                current.clear();
+            }
+            if word.width() > width {
+                for ch in word.chars() {
+                    if current.width() + ch.width().unwrap_or(0) > width {
+                        output.push(std::mem::take(&mut current));
+                    }
+                    current.push(ch);
+                }
+            } else {
+                current.push_str(word);
+            }
+        }
+        output.push(current.trim_end().to_string());
+    }
+    output
+}
+
+fn draw_horizontal_border(
+    buffer: &mut Buffer,
+    left: u16,
+    right: u16,
+    y: u16,
+    left_corner: char,
+    right_corner: char,
+    foreground: Color,
+    background: Color,
+) {
+    for x in left..right {
+        let ch = if x == left {
+            left_corner
+        } else if x + 1 == right {
+            right_corner
+        } else {
+            '─'
+        };
+        set_cell(buffer, x, y, ch, foreground, background);
+    }
+}
+
+fn set_cell(buffer: &mut Buffer, x: u16, y: u16, ch: char, foreground: Color, background: Color) {
+    if let Some(cell) = buffer.cell_mut((x, y)) {
+        cell.set_char(ch);
+        cell.set_style(Style::default().fg(foreground).bg(background));
+    }
+}
+
+fn fill(buffer: &mut Buffer, area: Rect, style: Style) {
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                cell.set_style(style);
+                cell.set_char(' ');
+            }
+        }
+    }
+}
+
+fn current_branch() -> Option<String> {
+    let output = Command::new("git")
+        .args(["branch", "--show-current"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!branch.is_empty()).then_some(branch)
+}
+
+fn collapse_home(path: &Path) -> String {
+    let value = path.display().to_string();
+    std::env::var("HOME")
+        .ok()
+        .and_then(|home| value.strip_prefix(&home).map(|rest| format!("~{rest}")))
+        .unwrap_or(value)
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    if value.width() <= width {
+        return value.to_string();
+    }
+    if width <= 1 {
+        return "…".to_string();
+    }
+    let mut output = String::new();
+    for ch in value.chars() {
+        if output.width() + ch.width().unwrap_or(0) >= width {
+            break;
+        }
+        output.push(ch);
+    }
+    output.push('…');
+    output
+}
+
+fn format_milliseconds(milliseconds: u128) -> String {
+    if milliseconds < 60_000 {
+        format!("{:.1}s", milliseconds as f64 / 1_000.0)
+    } else {
+        let minutes = milliseconds / 60_000;
+        let seconds = (milliseconds % 60_000) / 1_000;
+        format!("{minutes}m{seconds}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn composer_layout_tracks_unicode_cursor() {
+        let text = "Indus नदी";
+        let layout = layout_composer(text, text.len(), 40);
+        assert_eq!(layout.cursor_row, 0);
+        assert_eq!(layout.cursor_column as usize, text.width());
+    }
+
+    #[test]
+    fn composer_wraps_without_losing_text() {
+        let layout = layout_composer("abcdefgh", 8, 4);
+        assert_eq!(layout.lines, vec!["abcd", "efgh"]);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (1, 4));
+    }
+
+    #[test]
+    fn slash_dropdown_stays_at_six_visible_rows() {
+        assert_eq!(MAX_SLASH_ROWS, 6);
+    }
+}
