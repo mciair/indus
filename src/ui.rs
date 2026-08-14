@@ -11,8 +11,12 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    app::{App, HOME_MENU, HitZones, ToolVisualState, TranscriptEntry, TurnActivity},
+    app::{
+        App, CatalogModal, HOME_MENU, HitZones, ModelCatalogView, ToolVisualState, TranscriptEntry,
+        TurnActivity,
+    },
     harness::event::{DiffKind, FileDiff},
+    provider::ProviderId,
     theme::Theme,
 };
 
@@ -74,6 +78,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_composer(frame, prompt, app, &theme);
     if app.slash.open {
         render_slash_dropdown(frame, prompt, app, &theme, &mut zones);
+    }
+    if app.catalog_modal.is_some() {
+        render_catalog_modal(frame, app, &theme, &mut zones);
     }
     app.hit_zones = zones;
 }
@@ -808,7 +815,10 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
         }
     }
 
-    let info = format!(" indus · {} ", app.theme_kind.name());
+    let info = app.active_model().map_or_else(
+        || format!(" indus · {} ", app.theme_kind.name()),
+        |active| format!(" {} · {} ", active.model_name, active.provider.name()),
+    );
     if info.width() + 4 < area.width as usize {
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -823,6 +833,337 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
     let cursor_y = text_area.y + layout.cursor_row;
     if cursor_x < text_area.right() && cursor_y < text_area.bottom() {
         frame.set_cursor_position((cursor_x, cursor_y));
+    }
+}
+
+fn render_catalog_modal(frame: &mut Frame<'_>, app: &App, theme: &Theme, zones: &mut HitZones) {
+    let area = frame.area();
+    match app.catalog_modal.as_ref() {
+        Some(CatalogModal::Providers { selected }) => {
+            render_provider_catalog(frame, area, *selected, theme, zones)
+        }
+        Some(CatalogModal::Models(view)) => {
+            render_model_catalog(frame, area, view, app.animation_tick, theme, zones)
+        }
+        Some(CatalogModal::ApiKey {
+            provider,
+            input,
+            error,
+        }) => render_api_key_popover(frame, area, *provider, input, error.as_deref(), theme),
+        None => {}
+    }
+}
+
+fn render_provider_catalog(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    selected: usize,
+    theme: &Theme,
+    zones: &mut HitZones,
+) {
+    let width = area.width.saturating_sub(6).min(92).max(44);
+    let height = 11u16.min(area.height.saturating_sub(2)).max(8);
+    let panel = centered_rect(area, width.min(area.width), height.min(area.height));
+    render_popover_surface(frame, panel, theme);
+    render_popover_header(frame, panel, "Model Provider", theme);
+
+    let subtitle = Rect::new(panel.x + 3, panel.y + 2, panel.width.saturating_sub(6), 1);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "Select a provider to open its model catalog",
+            Style::default().fg(theme.gray),
+        )),
+        subtitle,
+    );
+
+    let rows_x = panel.x + 3;
+    let rows_width = panel.width.saturating_sub(6);
+    for (index, provider) in ProviderId::ALL.iter().enumerate() {
+        let row = Rect::new(rows_x, panel.y + 3 + index as u16, rows_width, 1);
+        let selected = index == selected;
+        let background = if selected {
+            theme.bg_visual
+        } else {
+            theme.bg_light
+        };
+        fill(frame.buffer_mut(), row, Style::default().bg(background));
+        let name = provider.name();
+        let label = "Compatible Interim Provider";
+        let gap = row
+            .width
+            .saturating_sub(name.width() as u16 + label.width() as u16 + 2);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    Style::default().fg(theme.accent_skill).bg(background),
+                ),
+                Span::styled(
+                    name,
+                    Style::default()
+                        .fg(theme.text_primary)
+                        .bg(background)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ".repeat(gap as usize), Style::default().bg(background)),
+                Span::styled(label, Style::default().fg(theme.gray_bright).bg(background)),
+            ])),
+            row,
+        );
+        zones.catalog_rows.push((row, index));
+    }
+
+    render_popover_footer(frame, panel, "enter open    ↑↓ navigate", theme);
+}
+
+fn render_model_catalog(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &ModelCatalogView,
+    animation_tick: u64,
+    theme: &Theme,
+    zones: &mut HitZones,
+) {
+    let width = area.width.saturating_sub(6).min(96).max(48);
+    let height = area.height.saturating_sub(4).clamp(10, 18);
+    let panel = centered_rect(area, width.min(area.width), height.min(area.height));
+    render_popover_surface(frame, panel, theme);
+    render_popover_header(
+        frame,
+        panel,
+        &format!("{} Models", view.provider.name()),
+        theme,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            view.provider.base_url(),
+            Style::default().fg(theme.gray),
+        )),
+        Rect::new(panel.x + 3, panel.y + 2, panel.width.saturating_sub(6), 1),
+    );
+
+    let rows_height = panel.height.saturating_sub(6) as usize;
+    let start = if view.selected >= rows_height {
+        view.selected + 1 - rows_height
+    } else {
+        0
+    };
+    for (offset, (index, model)) in view
+        .models
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(rows_height)
+        .enumerate()
+    {
+        let row = Rect::new(
+            panel.x + 3,
+            panel.y + 3 + offset as u16,
+            panel.width.saturating_sub(6),
+            1,
+        );
+        let selected = index == view.selected;
+        let background = if selected {
+            theme.bg_visual
+        } else {
+            theme.bg_light
+        };
+        fill(frame.buffer_mut(), row, Style::default().bg(background));
+        let suffix = model
+            .context_window
+            .map(format_context_window)
+            .unwrap_or_default();
+        let available = row.width.saturating_sub(suffix.width() as u16 + 4).max(1) as usize;
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    Style::default().fg(theme.accent_skill).bg(background),
+                ),
+                Span::styled(
+                    truncate(&model.name, available),
+                    Style::default()
+                        .fg(theme.text_primary)
+                        .bg(background)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " ".repeat(row.width.saturating_sub(
+                        truncate(&model.name, available).width() as u16 + suffix.width() as u16 + 2,
+                    ) as usize),
+                    Style::default().bg(background),
+                ),
+                Span::styled(suffix, Style::default().fg(theme.gray).bg(background)),
+            ])),
+            row,
+        );
+        zones.catalog_rows.push((row, index));
+    }
+
+    let message_area = Rect::new(
+        panel.x + 3,
+        panel.bottom().saturating_sub(3),
+        panel.width.saturating_sub(6),
+        1,
+    );
+    if view.loading {
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let spinner = frames[(animation_tick as usize / 2) % frames.len()];
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!("{spinner} Fetching available models…"),
+                Style::default().fg(theme.text_secondary),
+            )),
+            message_area,
+        );
+    } else if let Some(error) = &view.error {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                truncate(error, message_area.width as usize),
+                Style::default().fg(theme.accent_error),
+            )),
+            message_area,
+        );
+    } else if view.models.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "No compatible models were returned.",
+                Style::default().fg(theme.gray),
+            )),
+            message_area,
+        );
+    }
+
+    render_popover_footer(
+        frame,
+        panel,
+        "enter select    ↑↓ navigate    r refresh    k API key",
+        theme,
+    );
+}
+
+fn render_api_key_popover(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    _provider: ProviderId,
+    input: &crate::app::Composer,
+    error: Option<&str>,
+    theme: &Theme,
+) {
+    let width = ((area.width as u32 * 76) / 100) as u16;
+    let width = width.clamp(40, 90).min(area.width);
+    let height = 9u16.min(area.height).max(7.min(area.height));
+    let panel = centered_rect(area, width, height);
+    render_popover_surface(frame, panel, theme);
+    render_popover_header(frame, panel, "API key", theme);
+
+    let input_area = Rect::new(panel.x + 3, panel.y + 3, panel.width.saturating_sub(6), 1);
+    let masked = "•".repeat(input.text().chars().count());
+    let value = if masked.is_empty() {
+        "API key".to_string()
+    } else {
+        masked
+    };
+    let color = if input.is_empty() {
+        theme.gray
+    } else {
+        theme.text_primary
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(value, Style::default().fg(color))),
+        input_area,
+    );
+    if let Some(error) = error {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                truncate(error, input_area.width as usize),
+                Style::default().fg(theme.accent_error),
+            )),
+            Rect::new(input_area.x, input_area.y + 2, input_area.width, 1),
+        );
+    }
+    render_popover_footer(frame, panel, "enter submit", theme);
+
+    let cursor_column = input.text()[..input.cursor()].chars().count() as u16;
+    let cursor_x = input_area.x + cursor_column.min(input_area.width.saturating_sub(1));
+    frame.set_cursor_position((cursor_x, input_area.y));
+}
+
+fn render_popover_surface(frame: &mut Frame<'_>, panel: Rect, theme: &Theme) {
+    frame.render_widget(Clear, panel);
+    fill(
+        frame.buffer_mut(),
+        panel,
+        Style::default().fg(theme.text_primary).bg(theme.bg_light),
+    );
+}
+
+fn render_popover_header(frame: &mut Frame<'_>, panel: Rect, title: &str, theme: &Theme) {
+    let header = Rect::new(panel.x + 3, panel.y + 1, panel.width.saturating_sub(6), 1);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            title.to_string(),
+            Style::default()
+                .fg(theme.text_primary)
+                .add_modifier(Modifier::BOLD),
+        )),
+        header,
+    );
+    let escape = "esc";
+    frame.render_widget(
+        Paragraph::new(Line::styled(escape, Style::default().fg(theme.gray))),
+        Rect::new(
+            panel.right().saturating_sub(escape.width() as u16 + 3),
+            header.y,
+            escape.width() as u16,
+            1,
+        ),
+    );
+}
+
+fn render_popover_footer(frame: &mut Frame<'_>, panel: Rect, text: &str, theme: &Theme) {
+    let mut spans = Vec::new();
+    for (index, token) in text.split_whitespace().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let is_key = matches!(token, "enter" | "esc" | "↑↓" | "r" | "k");
+        spans.push(Span::styled(
+            token.to_string(),
+            Style::default().fg(if is_key {
+                theme.text_primary
+            } else {
+                theme.gray
+            }),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(
+            panel.x + 3,
+            panel.bottom().saturating_sub(2),
+            panel.width.saturating_sub(6),
+            1,
+        ),
+    );
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn format_context_window(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{}M ctx", tokens / 1_000_000)
+    } else if tokens >= 1_000 {
+        format!("{}K ctx", tokens / 1_000)
+    } else {
+        format!("{tokens} ctx")
     }
 }
 
