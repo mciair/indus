@@ -289,10 +289,8 @@ impl HarnessTool for GrepTool {
         if !output.status.success() && output.status.code() != Some(1) {
             return Err(command_error("rg", &output.stderr));
         }
-        let rows: Vec<&str> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .take(101)
-            .collect();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let rows: Vec<&str> = stdout.lines().take(101).collect();
         let truncated = rows.len() > 100;
         let mut rendered = rows
             .into_iter()
@@ -631,7 +629,7 @@ impl HarnessTool for WebFetchTool {
         if !input.url.starts_with("https://") && !input.url.starts_with("http://") {
             return Err(ToolError::new("URL must start with http:// or https://"));
         }
-        let mut response = self
+        let response = self
             .client
             .get(&input.url)
             .timeout(Duration::from_secs(input.timeout.clamp(1, 120)))
