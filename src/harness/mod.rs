@@ -9,6 +9,7 @@ pub mod event;
 pub mod jobs;
 pub mod model;
 pub mod permission;
+mod persistence;
 mod processor;
 pub mod session;
 pub mod tool;
@@ -31,10 +32,11 @@ use classifier::GoalCategory;
 use event::{HarnessEvent, PermissionReply, RunOutcome};
 use jobs::{Job, JobService, now_ms};
 use model::{
-    CancellationToken, ModelRequest, ModelTransport, TransportError, TransportErrorKind,
-    UnconfiguredTransport,
+    CancellationToken, ModelContent, ModelMessage, ModelRequest, ModelTransport, Role,
+    TransportError, TransportErrorKind, UnconfiguredTransport,
 };
 use permission::{PermissionAction, PermissionError, PermissionRule, PermissionService};
+use persistence::SessionStore;
 use processor::{ProcessOutcome, StreamProcessor};
 use session::{AssistantMessage, AssistantPart, Session, TextPart};
 use tool::{ToolContext, ToolRegistry};
@@ -96,6 +98,7 @@ pub struct Harness {
     next_run_id: AtomicU64,
     cancellation: Arc<Mutex<Option<CancellationToken>>>,
     jobs: JobService,
+    session_store: Option<SessionStore>,
 }
 
 impl Harness {
@@ -118,6 +121,7 @@ impl Harness {
             next_run_id: AtomicU64::new(0),
             cancellation: Arc::new(Mutex::new(None)),
             jobs: JobService::load(),
+            session_store: None,
         }
     }
 
@@ -126,6 +130,8 @@ impl Harness {
         let jobs = JobService::load();
         let tools = builtin_tools::registry(jobs.clone());
         let permissions = PermissionService::new(default_permission_rules());
+        let session_store = SessionStore::default_session();
+        let session = session_store.load();
         let (event_tx, event_rx) = mpsc::channel();
         Ok(Self {
             transport,
@@ -137,13 +143,14 @@ impl Harness {
                 classify_prompts: true,
                 ..HarnessConfig::default()
             },
-            session: Arc::new(Mutex::new(Session::default())),
+            session: Arc::new(Mutex::new(session)),
             event_tx,
             event_rx: Mutex::new(event_rx),
             busy: Arc::new(AtomicBool::new(false)),
             next_run_id: AtomicU64::new(0),
             cancellation: Arc::new(Mutex::new(None)),
             jobs,
+            session_store: Some(session_store),
         })
     }
 
@@ -170,11 +177,17 @@ impl Harness {
         }
 
         let run_id = self.next_run_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let parent_id = self
-            .session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push_user(prompt.clone());
+        let parent_id = {
+            let mut session = self
+                .session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let id = session.push_user(prompt.clone());
+            if let Some(store) = &self.session_store {
+                let _ = store.save(&session);
+            }
+            id
+        };
         let cancellation = CancellationToken::default();
         *self
             .cancellation
@@ -190,6 +203,7 @@ impl Harness {
             events: self.event_tx.clone(),
             cancellation: cancellation.clone(),
             jobs: self.jobs.clone(),
+            session_store: self.session_store.clone(),
         };
         let busy = Arc::clone(&self.busy);
         let active_cancellation = Arc::clone(&self.cancellation);
@@ -301,6 +315,7 @@ impl Harness {
             events: self.event_tx.clone(),
             cancellation,
             jobs: self.jobs.clone(),
+            session_store: None,
         };
         let events = self.event_tx.clone();
         let busy = Arc::clone(&self.busy);
@@ -356,6 +371,7 @@ struct Runtime {
     events: Sender<HarnessEvent>,
     cancellation: CancellationToken,
     jobs: JobService,
+    session_store: Option<SessionStore>,
 }
 
 impl Runtime {
@@ -382,7 +398,7 @@ impl Runtime {
             }
         }
 
-        for step in 1..=self.config.max_steps.max(1) {
+        'steps: for step in 1..=self.config.max_steps.max(1) {
             if self.cancellation.is_cancelled() {
                 return self.finish(run_id, RunOutcome::Cancelled);
             }
@@ -414,6 +430,9 @@ impl Runtime {
                     TransportErrorKind::ContextOverflow => {
                         let (message, _) = processor.finish(&|event| self.emit(event));
                         self.push_assistant(message);
+                        if self.compact(run_id) {
+                            continue 'steps;
+                        }
                         self.emit(HarnessEvent::CompactionRequired { run_id });
                         return self.finish(run_id, RunOutcome::CompactionRequired);
                     }
@@ -465,7 +484,6 @@ impl Runtime {
             }
 
             let (message, outcome) = processor.finish(&|event| self.emit(event));
-            let usage = message.usage;
             self.push_assistant(message);
 
             if self.cancellation.is_cancelled() {
@@ -474,13 +492,17 @@ impl Runtime {
             if blocked {
                 return self.finish(run_id, RunOutcome::Failed);
             }
-            if self
-                .config
-                .compaction_token_limit
-                .is_some_and(|limit| usage.total() >= limit)
-            {
-                self.emit(HarnessEvent::CompactionRequired { run_id });
-                return self.finish(run_id, RunOutcome::CompactionRequired);
+            if self.config.compaction_token_limit.is_some_and(|limit| {
+                self.session
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .total_usage()
+                    >= limit
+            }) {
+                if !self.compact(run_id) {
+                    self.emit(HarnessEvent::CompactionRequired { run_id });
+                    return self.finish(run_id, RunOutcome::CompactionRequired);
+                }
             }
             if outcome == ProcessOutcome::Stop {
                 return self.finish(run_id, RunOutcome::Completed);
@@ -682,6 +704,57 @@ impl Runtime {
         }
     }
 
+    fn compact(&self, run_id: u64) -> bool {
+        let source = {
+            let session = self
+                .session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if session.messages.len() < 4 {
+                return false;
+            }
+            session.summary_source(90_000)
+        };
+        self.emit(HarnessEvent::CompactionStarted { run_id });
+        let request = ModelRequest {
+            system: vec![
+                "Summarize this coding session for continuation after context compaction. Preserve the user's goals and constraints, decisions, files inspected or changed, commands and test outcomes, unresolved errors, active Jobs, and exact next steps. Do not include hidden reasoning. Return only the continuation summary."
+                    .to_string(),
+            ],
+            messages: vec![ModelMessage {
+                role: Role::User,
+                content: vec![ModelContent::Text(source)],
+            }],
+            tools: Vec::new(),
+            step: 0,
+        };
+        let mut summary = String::new();
+        let result = self.transport.stream(
+            request,
+            &mut |event| {
+                if let model::ModelEvent::TextDelta { text, .. } = event {
+                    summary.push_str(&text);
+                }
+                Ok(())
+            },
+            &self.cancellation,
+        );
+        if result.is_err() || summary.trim().is_empty() {
+            return false;
+        }
+        let mut session = self
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        session.compact(summary, 4);
+        if let Some(store) = &self.session_store {
+            let _ = store.save(&session);
+        }
+        drop(session);
+        self.emit(HarnessEvent::CompactionFinished { run_id });
+        true
+    }
+
     fn wait_or_cancel(&self, milliseconds: u64) -> Result<(), TransportError> {
         let mut remaining = milliseconds;
         while remaining > 0 {
@@ -694,10 +767,14 @@ impl Runtime {
     }
 
     fn push_assistant(&self, message: session::AssistantMessage) {
-        self.session
+        let mut session = self
+            .session
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push_assistant(message);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        session.push_assistant(message);
+        if let Some(store) = &self.session_store {
+            let _ = store.save(&session);
+        }
     }
 
     fn emit(&self, event: HarnessEvent) {
