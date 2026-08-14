@@ -75,6 +75,7 @@ impl Composer {
         self.text.is_empty()
     }
 
+    #[cfg(test)]
     pub fn set(&mut self, value: impl Into<String>) {
         self.text = value.into();
         self.cursor = self.text.len();
@@ -148,6 +149,8 @@ impl Composer {
     }
 }
 
+/// Transcript variants are populated by the transport adapter as stream events arrive.
+#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TranscriptEntry {
     User {
@@ -166,6 +169,8 @@ pub enum TranscriptEntry {
     Event(String),
 }
 
+/// Live activity reported by the Indus agent transport.
+#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TurnActivity {
     WaitingForResponse,
@@ -189,6 +194,7 @@ impl TurnActivity {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ActiveTurn {
     pub activity: TurnActivity,
@@ -210,6 +216,7 @@ impl ActiveTurn {
         }
     }
 
+    #[allow(dead_code)]
     fn set_activity(&mut self, activity: TurnActivity) {
         self.activity = activity;
         self.activity_started_at = Instant::now();
@@ -348,6 +355,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     pub fn begin_thinking(&mut self) {
         let Some(turn) = self.turn.as_mut() else {
             return;
@@ -362,6 +370,7 @@ impl App {
         turn.thinking_entry = Some(entry);
     }
 
+    #[allow(dead_code)]
     pub fn push_thinking(&mut self, chunk: &str) {
         if self.turn.is_none() {
             return;
@@ -375,6 +384,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     pub fn begin_responding(&mut self) {
         let Some(turn) = self.turn.as_mut() else {
             return;
@@ -398,6 +408,7 @@ impl App {
         turn.assistant_entry = Some(entry);
     }
 
+    #[allow(dead_code)]
     pub fn push_response(&mut self, chunk: &str) {
         if self.turn.is_none() {
             return;
@@ -411,6 +422,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     pub fn finish_turn(&mut self) {
         let Some(turn) = self.turn.take() else {
             return;
@@ -567,6 +579,7 @@ fn recognized_slash_tokens(text: &str) -> Vec<Range<usize>> {
         .collect()
 }
 
+#[allow(dead_code)]
 fn format_elapsed(milliseconds: u128) -> String {
     if milliseconds < 60_000 {
         format!("{:.1}s", milliseconds as f64 / 1_000.0)
