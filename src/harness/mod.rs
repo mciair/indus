@@ -498,11 +498,10 @@ impl Runtime {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .total_usage()
                     >= limit
-            }) {
-                if !self.compact(run_id) {
-                    self.emit(HarnessEvent::CompactionRequired { run_id });
-                    return self.finish(run_id, RunOutcome::CompactionRequired);
-                }
+            }) && !self.compact(run_id)
+            {
+                self.emit(HarnessEvent::CompactionRequired { run_id });
+                return self.finish(run_id, RunOutcome::CompactionRequired);
             }
             if outcome == ProcessOutcome::Stop {
                 return self.finish(run_id, RunOutcome::Completed);
