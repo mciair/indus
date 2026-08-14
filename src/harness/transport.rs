@@ -100,14 +100,16 @@ impl ProviderTransport {
         on_event: &mut dyn FnMut(ModelEvent) -> Result<(), TransportError>,
         cancellation: &CancellationToken,
     ) -> Result<(), TransportError> {
-        let body = json!({
+        let mut body = json!({
             "model": selection.model_id,
             "messages": openai_messages(&request),
-            "tools": openai_tools(&request.tools),
-            "tool_choice": if request.tools.is_empty() { Value::Null } else { json!("auto") },
             "stream": true,
             "stream_options": { "include_usage": true }
         });
+        if !request.tools.is_empty() {
+            body["tools"] = json!(openai_tools(&request.tools));
+            body["tool_choice"] = json!("auto");
+        }
         let mut builder = self
             .client
             .post(format!(
@@ -262,14 +264,16 @@ impl ProviderTransport {
         on_event: &mut dyn FnMut(ModelEvent) -> Result<(), TransportError>,
         cancellation: &CancellationToken,
     ) -> Result<(), TransportError> {
-        let body = json!({
+        let mut body = json!({
             "model": selection.model_id,
             "system": request.system.join("\n\n"),
             "messages": anthropic_messages(&request.messages),
-            "tools": anthropic_tools(&request.tools),
             "max_tokens": 16384,
             "stream": true
         });
+        if !request.tools.is_empty() {
+            body["tools"] = json!(anthropic_tools(&request.tools));
+        }
         let response = send(
             self.client
                 .post(format!("{}/messages", selection.provider.base_url()))
@@ -409,12 +413,14 @@ impl ProviderTransport {
             .model_id
             .strip_prefix("models/")
             .unwrap_or(&selection.model_id);
-        let body = json!({
+        let mut body = json!({
             "systemInstruction": { "parts": [{ "text": request.system.join("\n\n") }] },
             "contents": gemini_messages(&request.messages),
-            "tools": [{ "functionDeclarations": gemini_tools(&request.tools) }],
             "generationConfig": { "maxOutputTokens": 16384 }
         });
+        if !request.tools.is_empty() {
+            body["tools"] = json!([{ "functionDeclarations": gemini_tools(&request.tools) }]);
+        }
         let response = send(
             self.client
                 .post(format!(
