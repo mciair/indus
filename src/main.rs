@@ -421,6 +421,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             if app.slash_open()
                 && !app.slash_matches().is_empty()
                 && app.input.split_whitespace().count() == 1
+                && !app.input.ends_with(' ')
             {
                 app.select_slash();
             } else {
