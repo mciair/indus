@@ -516,10 +516,17 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::{Duration, Instant},
+    };
 
     use super::*;
-    use crate::harness::model::{ModelEvent, StopReason, Usage};
+    use crate::harness::{
+        model::{ModelEvent, StopReason, ToolDefinition, Usage},
+        permission::{PermissionAction, PermissionRule},
+        tool::{HarnessTool, ToolError, ToolOutput, ToolPermission},
+    };
 
     struct TextTransport;
 
@@ -540,6 +547,80 @@ mod tests {
             on_event(ModelEvent::StepFinished {
                 reason: StopReason::Stop,
                 usage: Usage::default(),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct ToolTransport {
+        calls: AtomicUsize,
+    }
+
+    impl ModelTransport for ToolTransport {
+        fn stream(
+            &self,
+            request: ModelRequest,
+            on_event: &mut dyn FnMut(ModelEvent) -> Result<(), TransportError>,
+            _cancellation: &CancellationToken,
+        ) -> Result<(), TransportError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                assert_eq!(request.step, 1);
+                on_event(ModelEvent::ToolCall {
+                    id: "call-1".into(),
+                    name: "status".into(),
+                    input: "repository".into(),
+                })?;
+                on_event(ModelEvent::StepFinished {
+                    reason: StopReason::ToolCalls,
+                    usage: Usage::default(),
+                })
+            } else {
+                assert!(request.messages.iter().any(|message| {
+                    message.content.iter().any(|content| {
+                        matches!(
+                            content,
+                            model::ModelContent::ToolResult { output, .. } if output == "clean"
+                        )
+                    })
+                }));
+                on_event(ModelEvent::TextStarted { id: "t2".into() })?;
+                on_event(ModelEvent::TextDelta {
+                    id: "t2".into(),
+                    text: "The repository is clean.".into(),
+                })?;
+                on_event(ModelEvent::TextFinished { id: "t2".into() })?;
+                on_event(ModelEvent::StepFinished {
+                    reason: StopReason::Stop,
+                    usage: Usage::default(),
+                })
+            }
+        }
+    }
+
+    struct StatusTool;
+
+    impl HarnessTool for StatusTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "status".into(),
+                description: "Check repository status".into(),
+                input_schema: "{}".into(),
+            }
+        }
+
+        fn permission(&self, input: &str) -> ToolPermission {
+            ToolPermission {
+                permission: "status".into(),
+                patterns: vec![input.to_string()],
+                description: "Check repository status".into(),
+            }
+        }
+
+        fn execute(&self, _input: &str, _context: &ToolContext) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                title: "Checked repository status".into(),
+                output: "clean".into(),
+                diffs: Vec::new(),
             })
         }
     }
@@ -570,6 +651,59 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event,
             HarnessEvent::TextDelta { text, .. } if text == "Hello from Indus"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HarnessEvent::RunFinished {
+                outcome: RunOutcome::Completed,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn tool_results_continue_into_the_next_model_step() {
+        let tools = ToolRegistry::default();
+        tools.register(StatusTool);
+        let permissions = PermissionService::new(vec![PermissionRule {
+            permission: "status".into(),
+            pattern: "*".into(),
+            action: PermissionAction::Allow,
+        }]);
+        let harness = Harness::new(
+            Arc::new(ToolTransport::default()),
+            tools,
+            permissions,
+            HarnessConfig::default(),
+        );
+        harness.submit("inspect the repository").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut events = Vec::new();
+        while Instant::now() < deadline {
+            events.extend(harness.drain_events());
+            if events
+                .iter()
+                .any(|event| matches!(event, HarnessEvent::RunFinished { .. }))
+            {
+                break;
+            }
+            thread::yield_now();
+        }
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, HarnessEvent::ToolStarted { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, HarnessEvent::ToolFinished { .. }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HarnessEvent::TextDelta { text, .. } if text == "The repository is clean."
         )));
         assert!(events.iter().any(|event| matches!(
             event,
