@@ -1,9 +1,4 @@
-use std::{
-    io,
-    path::PathBuf,
-    process::Command,
-    time::Duration,
-};
+use std::{io, path::PathBuf, process::Command, time::Duration};
 
 use anyhow::Result;
 use crossterm::{
@@ -568,9 +563,7 @@ fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, zone
     let title_line = Line::from(vec![
         Span::styled(
             PRODUCT,
-            Style::default()
-                .fg(theme.text)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ", Style::default()),
         Span::styled("India's AI-native CLI", Style::default().fg(theme.text)),
@@ -613,7 +606,10 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         if y < content.y {
             break;
         }
-        let width = message.width().min(content.width.saturating_sub(6) as usize) as u16 + 4;
+        let width = message
+            .width()
+            .min(content.width.saturating_sub(6) as usize) as u16
+            + 4;
         let x = content.right().saturating_sub(width);
         let row = Rect {
             x,
@@ -624,7 +620,10 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         fill(frame.buffer_mut(), row, Style::default().bg(theme.sent_bg));
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("  {}  ", truncate(message, width.saturating_sub(4) as usize)),
+                format!(
+                    "  {}  ",
+                    truncate(message, width.saturating_sub(4) as usize)
+                ),
                 Style::default().fg(theme.sent_text).bg(theme.sent_bg),
             ))),
             row,
@@ -874,9 +873,7 @@ impl ThemeKind {
             "auto" => Some(Self::Auto),
             "indus-night" | "indusnight" | "night" | "dark" => Some(Self::IndusNight),
             "indusday" | "indus-day" | "day" | "light" => Some(Self::IndusDay),
-            "indus-midnight" | "indusmidnight" | "midnight" | "oscura" => {
-                Some(Self::IndusMidnight)
-            }
+            "indus-midnight" | "indusmidnight" | "midnight" | "oscura" => Some(Self::IndusMidnight),
             "indus-warm" | "induswarm" | "warm" => Some(Self::IndusWarm),
             _ => None,
         }
