@@ -1,6 +1,6 @@
 //! Events emitted by the Indus harness for presentation and external clients.
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunOutcome {
     Completed,
     Scheduled,
