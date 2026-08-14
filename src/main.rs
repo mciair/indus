@@ -18,12 +18,12 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     buffer::Buffer,
-    layout::{Alignment, Constraint, Flex, Layout, Margin, Rect},
-    style::{Color, Modifier, Style, Stylize},
+    layout::{Constraint, Flex, Layout, Margin, Rect},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const PRODUCT: &str = "Indus";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
