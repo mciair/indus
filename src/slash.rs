@@ -208,14 +208,6 @@ pub static COMMANDS: &[SlashCommand] = &[
         "Show product announcements",
         "/announcements",
     ),
-    SlashCommand::with_args(
-        "remember",
-        "Store a project memory",
-        "/remember <note>",
-        "<note>",
-        true,
-        ArgumentSource::None,
-    ),
     SlashCommand::plain("plan", "Enter planning mode", "/plan"),
     SlashCommand::plain("view-plan", "View the current plan", "/view-plan"),
     SlashCommand::plain("resume", "Resume a previous session", "/resume"),
@@ -549,7 +541,7 @@ mod tests {
 
     #[test]
     fn excluded_commands_are_not_registered() {
-        for name in ["plugins", "imagine", "imagine-video"] {
+        for name in ["plugins", "imagine", "imagine-video", "remember"] {
             assert!(COMMANDS.iter().all(|command| command.name != name));
         }
     }
