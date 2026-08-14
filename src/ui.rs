@@ -237,7 +237,7 @@ struct TranscriptRow {
 fn render_transcript(
     frame: &mut Frame<'_>,
     area: Rect,
-    app: &App,
+    app: &mut App,
     theme: &Theme,
     zones: &mut HitZones,
 ) {
@@ -248,17 +248,71 @@ fn render_transcript(
         build_transcript_rows(&mut rows, index, entry, width, theme);
     }
     let visible = area.height as usize;
-    let start = rows.len().saturating_sub(visible);
-    for (offset, row) in rows.into_iter().skip(start).take(visible).enumerate() {
+    let row_text = rows.iter().map(transcript_row_text).collect();
+    let start = app.sync_transcript_viewport(area, row_text);
+    for (offset, row) in rows.iter().skip(start).take(visible).enumerate() {
         let target = Rect::new(area.x, area.y + offset as u16, area.width, 1);
         fill(
             frame.buffer_mut(),
             target,
             Style::default().bg(row.background),
         );
-        frame.render_widget(Paragraph::new(row.line), target);
+        frame.render_widget(Paragraph::new(row.line.clone()), target);
         if let Some(index) = row.fold_entry {
             zones.fold_rows.push((target, index));
+        }
+    }
+    render_text_selection(frame.buffer_mut(), area, app, start);
+    render_transcript_scrollbar(frame.buffer_mut(), area, app, theme);
+}
+
+fn transcript_row_text(row: &TranscriptRow) -> String {
+    row.line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+fn render_text_selection(buffer: &mut Buffer, area: Rect, app: &App, start: usize) {
+    let selection_style = Style::default().add_modifier(Modifier::REVERSED);
+    for viewport_row in 0..area.height as usize {
+        let Some((selection_start, selection_end)) =
+            app.selection_display_range(start + viewport_row)
+        else {
+            continue;
+        };
+        let first = selection_start.min(area.width as usize);
+        let last = selection_end.min(area.width as usize);
+        for column in first..last {
+            if let Some(cell) =
+                buffer.cell_mut((area.x + column as u16, area.y + viewport_row as u16))
+            {
+                cell.set_style(selection_style);
+            }
+        }
+    }
+}
+
+fn render_transcript_scrollbar(buffer: &mut Buffer, area: Rect, app: &App, theme: &Theme) {
+    let (position, visible, total) = app.transcript_scroll_metrics();
+    if area.width == 0 || area.height == 0 || total <= visible {
+        return;
+    }
+    let track = area.height as usize;
+    let thumb_size = (visible.saturating_mul(track) / total).clamp(1, track);
+    let maximum = total.saturating_sub(visible);
+    let thumb_top = position.saturating_mul(track.saturating_sub(thumb_size)) / maximum.max(1);
+    let x = area.right().saturating_sub(1);
+    for offset in 0..track {
+        if let Some(cell) = buffer.cell_mut((x, area.y + offset as u16)) {
+            let in_thumb = offset >= thumb_top && offset < thumb_top + thumb_size;
+            cell.set_char('▐');
+            cell.set_style(Style::default().fg(if in_thumb {
+                theme.scrollbar_fg
+            } else {
+                theme.scrollbar_bg
+            }));
         }
     }
 }
