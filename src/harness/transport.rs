@@ -69,6 +69,10 @@ impl Default for ProviderTransport {
 }
 
 impl ModelTransport for ProviderTransport {
+    fn context_window(&self) -> Option<u64> {
+        ProviderStore::load().active_context_window()
+    }
+
     fn stream(
         &self,
         request: ModelRequest,
@@ -848,15 +852,17 @@ fn stop_reason(value: &str) -> StopReason {
 }
 
 fn openai_usage(value: &Value) -> Usage {
+    let input_tokens = value
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = value
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     Usage {
-        input_tokens: value
-            .get("prompt_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        output_tokens: value
-            .get("completion_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        input_tokens,
+        output_tokens,
         reasoning_tokens: value
             .pointer("/completion_tokens_details/reasoning_tokens")
             .and_then(Value::as_u64)
@@ -866,6 +872,7 @@ fn openai_usage(value: &Value) -> Usage {
             .and_then(Value::as_u64)
             .unwrap_or(0),
         cache_write_tokens: 0,
+        context_tokens: input_tokens.saturating_add(output_tokens),
     }
 }
 
@@ -894,27 +901,43 @@ fn merge_anthropic_usage(usage: &mut Usage, value: &Value) {
             .and_then(Value::as_u64)
             .unwrap_or(0),
     );
+    usage.context_tokens = usage
+        .input_tokens
+        .saturating_add(usage.output_tokens)
+        .saturating_add(usage.cache_read_tokens)
+        .saturating_add(usage.cache_write_tokens);
 }
 
 fn gemini_usage(value: &Value) -> Usage {
+    let input_tokens = value
+        .get("promptTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = value
+        .get("candidatesTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let reasoning_tokens = value
+        .get("thoughtsTokenCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     Usage {
-        input_tokens: value
-            .get("promptTokenCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        output_tokens: value
-            .get("candidatesTokenCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        reasoning_tokens: value
-            .get("thoughtsTokenCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
         cache_read_tokens: value
             .get("cachedContentTokenCount")
             .and_then(Value::as_u64)
             .unwrap_or(0),
         cache_write_tokens: 0,
+        context_tokens: value
+            .get("totalTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| {
+                input_tokens
+                    .saturating_add(output_tokens)
+                    .saturating_add(reasoning_tokens)
+            }),
     }
 }
 
@@ -1008,5 +1031,40 @@ mod tests {
             "secret response",
         );
         assert!(!message.contains("secret response"));
+    }
+
+    #[test]
+    fn provider_usage_tracks_current_context_without_cache_double_counting() {
+        let openai = openai_usage(&json!({
+            "prompt_tokens": 80_000,
+            "completion_tokens": 2_000,
+            "prompt_tokens_details": { "cached_tokens": 70_000 },
+            "completion_tokens_details": { "reasoning_tokens": 1_000 }
+        }));
+        assert_eq!(openai.context_tokens, 82_000);
+
+        let gemini = gemini_usage(&json!({
+            "promptTokenCount": 80_000,
+            "candidatesTokenCount": 2_000,
+            "thoughtsTokenCount": 1_000,
+            "cachedContentTokenCount": 70_000,
+            "totalTokenCount": 83_000
+        }));
+        assert_eq!(gemini.context_tokens, 83_000);
+    }
+
+    #[test]
+    fn anthropic_context_includes_cached_and_uncached_input() {
+        let mut usage = Usage::default();
+        merge_anthropic_usage(
+            &mut usage,
+            &json!({
+                "input_tokens": 10_000,
+                "output_tokens": 2_000,
+                "cache_read_input_tokens": 70_000,
+                "cache_creation_input_tokens": 1_000
+            }),
+        );
+        assert_eq!(usage.context_tokens, 83_000);
     }
 }
