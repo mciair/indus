@@ -3,12 +3,16 @@
 //! The harness owns orchestration only. Model selection and provider-specific
 //! authentication remain outside this module and connect through `ModelTransport`.
 
+mod builtin_tools;
+mod classifier;
 pub mod event;
+pub mod jobs;
 pub mod model;
 pub mod permission;
 mod processor;
 pub mod session;
 pub mod tool;
+mod transport;
 
 use std::{
     error::Error,
@@ -23,15 +27,18 @@ use std::{
     time::Duration,
 };
 
+use classifier::GoalCategory;
 use event::{HarnessEvent, PermissionReply, RunOutcome};
+use jobs::{Job, JobService, now_ms};
 use model::{
     CancellationToken, ModelRequest, ModelTransport, TransportError, TransportErrorKind,
     UnconfiguredTransport,
 };
-use permission::{PermissionError, PermissionService};
+use permission::{PermissionAction, PermissionError, PermissionRule, PermissionService};
 use processor::{ProcessOutcome, StreamProcessor};
-use session::Session;
+use session::{AssistantMessage, AssistantPart, Session, TextPart};
 use tool::{ToolContext, ToolRegistry};
+use transport::ProviderTransport;
 
 const DEFAULT_MAX_STEPS: usize = 64;
 const DEFAULT_MAX_RETRIES: u16 = 3;
@@ -45,6 +52,7 @@ pub struct HarnessConfig {
     pub max_steps: usize,
     pub max_retries: u16,
     pub compaction_token_limit: Option<u64>,
+    pub classify_prompts: bool,
 }
 
 impl Default for HarnessConfig {
@@ -54,6 +62,7 @@ impl Default for HarnessConfig {
             max_steps: DEFAULT_MAX_STEPS,
             max_retries: DEFAULT_MAX_RETRIES,
             compaction_token_limit: None,
+            classify_prompts: false,
         }
     }
 }
@@ -86,6 +95,7 @@ pub struct Harness {
     busy: Arc<AtomicBool>,
     next_run_id: AtomicU64,
     cancellation: Arc<Mutex<Option<CancellationToken>>>,
+    jobs: JobService,
 }
 
 impl Harness {
@@ -107,7 +117,34 @@ impl Harness {
             busy: Arc::new(AtomicBool::new(false)),
             next_run_id: AtomicU64::new(0),
             cancellation: Arc::new(Mutex::new(None)),
+            jobs: JobService::load(),
         }
+    }
+
+    pub fn configured() -> Result<Self, TransportError> {
+        let transport: Arc<dyn ModelTransport> = Arc::new(ProviderTransport::new()?);
+        let jobs = JobService::load();
+        let tools = builtin_tools::registry(jobs.clone());
+        let permissions = PermissionService::new(default_permission_rules());
+        let (event_tx, event_rx) = mpsc::channel();
+        Ok(Self {
+            transport,
+            tools,
+            permissions,
+            config: HarnessConfig {
+                system: vec![default_system_prompt()],
+                compaction_token_limit: Some(100_000),
+                classify_prompts: true,
+                ..HarnessConfig::default()
+            },
+            session: Arc::new(Mutex::new(Session::default())),
+            event_tx,
+            event_rx: Mutex::new(event_rx),
+            busy: Arc::new(AtomicBool::new(false)),
+            next_run_id: AtomicU64::new(0),
+            cancellation: Arc::new(Mutex::new(None)),
+            jobs,
+        })
     }
 
     pub fn provider_neutral() -> Self {
@@ -137,7 +174,7 @@ impl Harness {
             .session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push_user(prompt);
+            .push_user(prompt.clone());
         let cancellation = CancellationToken::default();
         *self
             .cancellation
@@ -152,11 +189,14 @@ impl Harness {
             session: Arc::clone(&self.session),
             events: self.event_tx.clone(),
             cancellation: cancellation.clone(),
+            jobs: self.jobs.clone(),
         };
         let busy = Arc::clone(&self.busy);
         let active_cancellation = Arc::clone(&self.cancellation);
         thread::spawn(move || {
-            let result = catch_unwind(AssertUnwindSafe(|| runtime.run(run_id, parent_id)));
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                runtime.run(run_id, parent_id, Some(&prompt))
+            }));
             if result.is_err() {
                 let _ = runtime.events.send(HarnessEvent::RunError {
                     run_id,
@@ -210,6 +250,89 @@ impl Harness {
     pub fn is_busy(&self) -> bool {
         self.busy.load(Ordering::Acquire)
     }
+
+    pub fn poll_jobs(&self) {
+        if self.busy.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(job) = self.jobs.due(now_ms()).into_iter().next() else {
+            return;
+        };
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let started_at = now_ms();
+        if self
+            .jobs
+            .mark_started(&job.id, started_at)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            self.busy.store(false, Ordering::Release);
+            return;
+        }
+
+        let run_id = self.next_run_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let session = Arc::new(Mutex::new(Session::new(format!("job:{}", job.id))));
+        let prompt = persistent_job_prompt(&job);
+        let parent_id = session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_user(prompt);
+        let cancellation = CancellationToken::default();
+        *self
+            .cancellation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cancellation.clone());
+        let runtime = Runtime {
+            transport: Arc::clone(&self.transport),
+            tools: self.tools.clone(),
+            permissions: self.permissions.clone(),
+            config: HarnessConfig {
+                classify_prompts: false,
+                ..self.config.clone()
+            },
+            session: Arc::clone(&session),
+            events: self.event_tx.clone(),
+            cancellation,
+            jobs: self.jobs.clone(),
+        };
+        let events = self.event_tx.clone();
+        let busy = Arc::clone(&self.busy);
+        let active_cancellation = Arc::clone(&self.cancellation);
+        let jobs = self.jobs.clone();
+        thread::spawn(move || {
+            let _ = events.send(HarnessEvent::JobRunStarted {
+                run_id,
+                job_id: job.id.clone(),
+                name: job.name.clone(),
+            });
+            let outcome = catch_unwind(AssertUnwindSafe(|| runtime.run(run_id, parent_id, None)))
+                .unwrap_or(RunOutcome::Failed);
+            let succeeded = outcome == RunOutcome::Completed;
+            let result = session_result(&session);
+            if succeeded {
+                let _ = jobs.mark_completed(&job.id, now_ms(), result);
+            } else {
+                let _ = jobs.mark_failed(&job.id, now_ms(), result);
+            }
+            let _ = events.send(HarnessEvent::JobRunFinished {
+                run_id,
+                job_id: job.id,
+                name: job.name,
+                succeeded,
+            });
+            busy.store(false, Ordering::Release);
+            *active_cancellation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        });
+    }
 }
 
 impl Default for Harness {
@@ -232,16 +355,36 @@ struct Runtime {
     session: Arc<Mutex<Session>>,
     events: Sender<HarnessEvent>,
     cancellation: CancellationToken,
+    jobs: JobService,
 }
 
 impl Runtime {
-    fn run(&self, run_id: u64, parent_id: u64) {
+    fn run(&self, run_id: u64, parent_id: u64, classify_goal: Option<&str>) -> RunOutcome {
         self.emit(HarnessEvent::RunStarted { run_id });
+
+        if self.config.classify_prompts
+            && let Some(goal) = classify_goal
+        {
+            self.emit(HarnessEvent::ClassifierStarted { run_id });
+            let decision = classifier::classify(self.transport.as_ref(), goal, &self.cancellation)
+                .unwrap_or_else(|_| {
+                    classifier::Classification::fallback(
+                        "Classifier failed; Indus will handle the request directly.",
+                    )
+                });
+            self.emit(HarnessEvent::ClassifierFinished {
+                run_id,
+                category: format!("{:?}", decision.category),
+                description: decision.short_description.clone(),
+            });
+            if decision.category == GoalCategory::TimeBasedJob {
+                return self.schedule_job(run_id, parent_id, goal, decision);
+            }
+        }
 
         for step in 1..=self.config.max_steps.max(1) {
             if self.cancellation.is_cancelled() {
-                self.finish(run_id, RunOutcome::Cancelled);
-                return;
+                return self.finish(run_id, RunOutcome::Cancelled);
             }
 
             let (assistant, messages) = {
@@ -266,13 +409,13 @@ impl Runtime {
                         processor.fail_stream(error.message, &|event| self.emit(event));
                         let (message, _) = processor.finish(&|event| self.emit(event));
                         self.push_assistant(message);
-                        self.finish(run_id, RunOutcome::Cancelled);
+                        return self.finish(run_id, RunOutcome::Cancelled);
                     }
                     TransportErrorKind::ContextOverflow => {
                         let (message, _) = processor.finish(&|event| self.emit(event));
                         self.push_assistant(message);
                         self.emit(HarnessEvent::CompactionRequired { run_id });
-                        self.finish(run_id, RunOutcome::CompactionRequired);
+                        return self.finish(run_id, RunOutcome::CompactionRequired);
                     }
                     TransportErrorKind::Retryable | TransportErrorKind::Fatal => {
                         processor.fail_stream(&error.message, &|event| self.emit(event));
@@ -282,10 +425,9 @@ impl Runtime {
                             run_id,
                             message: error.message,
                         });
-                        self.finish(run_id, RunOutcome::Failed);
+                        return self.finish(run_id, RunOutcome::Failed);
                     }
                 }
-                return;
             }
 
             let calls = processor.pending_tools().to_vec();
@@ -327,12 +469,10 @@ impl Runtime {
             self.push_assistant(message);
 
             if self.cancellation.is_cancelled() {
-                self.finish(run_id, RunOutcome::Cancelled);
-                return;
+                return self.finish(run_id, RunOutcome::Cancelled);
             }
             if blocked {
-                self.finish(run_id, RunOutcome::Failed);
-                return;
+                return self.finish(run_id, RunOutcome::Failed);
             }
             if self
                 .config
@@ -340,12 +480,10 @@ impl Runtime {
                 .is_some_and(|limit| usage.total() >= limit)
             {
                 self.emit(HarnessEvent::CompactionRequired { run_id });
-                self.finish(run_id, RunOutcome::CompactionRequired);
-                return;
+                return self.finish(run_id, RunOutcome::CompactionRequired);
             }
             if outcome == ProcessOutcome::Stop {
-                self.finish(run_id, RunOutcome::Completed);
-                return;
+                return self.finish(run_id, RunOutcome::Completed);
             }
         }
 
@@ -353,7 +491,64 @@ impl Runtime {
             run_id,
             message: "The harness reached its configured step limit.".to_string(),
         });
-        self.finish(run_id, RunOutcome::StepLimitReached);
+        self.finish(run_id, RunOutcome::StepLimitReached)
+    }
+
+    fn schedule_job(
+        &self,
+        run_id: u64,
+        parent_id: u64,
+        goal: &str,
+        decision: classifier::Classification,
+    ) -> RunOutcome {
+        let job = match self.jobs.create(goal, decision) {
+            Ok(job) => job,
+            Err(error) => {
+                self.emit(HarnessEvent::RunError {
+                    run_id,
+                    message: format!("Could not persist the Job: {error}"),
+                });
+                return self.finish(run_id, RunOutcome::Failed);
+            }
+        };
+        let schedule = job.schedule_description();
+        self.emit(HarnessEvent::JobScheduled {
+            run_id,
+            job_id: job.id.clone(),
+            name: job.name.clone(),
+            schedule: schedule.clone(),
+        });
+        let text = format!("Scheduled {} {}.", job.name, schedule);
+        let text_id = format!("job-{}", job.id);
+        self.emit(HarnessEvent::TextStarted {
+            run_id,
+            text_id: text_id.clone(),
+        });
+        self.emit(HarnessEvent::TextDelta {
+            run_id,
+            text_id: text_id.clone(),
+            text: text.clone(),
+        });
+        self.emit(HarnessEvent::TextFinished {
+            run_id,
+            text_id: text_id.clone(),
+        });
+        let mut assistant = AssistantMessage::new(
+            self.session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .next_assistant(parent_id)
+                .id,
+            parent_id,
+        );
+        assistant.parts.push(AssistantPart::Text(TextPart {
+            id: text_id,
+            text,
+            completed: true,
+        }));
+        assistant.finish = Some(model::StopReason::Stop);
+        self.push_assistant(assistant);
+        self.finish(run_id, RunOutcome::Scheduled)
     }
 
     fn stream_with_retry(
@@ -509,9 +704,110 @@ impl Runtime {
         let _ = self.events.send(event);
     }
 
-    fn finish(&self, run_id: u64, outcome: RunOutcome) {
+    fn finish(&self, run_id: u64, outcome: RunOutcome) -> RunOutcome {
         self.emit(HarnessEvent::RunFinished { run_id, outcome });
+        outcome
     }
+}
+
+fn default_permission_rules() -> Vec<PermissionRule> {
+    [
+        "read",
+        "glob",
+        "grep",
+        "todo",
+        "job",
+        "repo_overview",
+        "web_search",
+        "web_fetch",
+    ]
+    .into_iter()
+    .map(|permission| PermissionRule {
+        permission: permission.to_string(),
+        pattern: "*".to_string(),
+        action: PermissionAction::Allow,
+    })
+    .chain([
+        PermissionRule {
+            permission: "edit".into(),
+            pattern: "*".into(),
+            action: PermissionAction::Ask,
+        },
+        PermissionRule {
+            permission: "shell".into(),
+            pattern: "*".into(),
+            action: PermissionAction::Ask,
+        },
+        PermissionRule {
+            permission: "repo_clone".into(),
+            pattern: "*".into(),
+            action: PermissionAction::Ask,
+        },
+        PermissionRule {
+            permission: "doom_loop".into(),
+            pattern: "*".into(),
+            action: PermissionAction::Ask,
+        },
+    ])
+    .collect()
+}
+
+fn default_system_prompt() -> String {
+    [
+        "You are Indus, an AI coding agent operating in the user's current working directory.",
+        "Inspect relevant files before changing them. Use the provided tools to complete work, not merely describe it.",
+        "Keep changes focused, preserve unrelated user work, and verify material edits with appropriate tests or checks.",
+        "Use read, glob, and grep for discovery; edit, write, or apply_patch for precise changes; and shell for builds, tests, and Git operations.",
+        "Use web_search for current external information and web_fetch for a known page. Cite useful source URLs in the response.",
+        "Do not expose hidden reasoning. Stream only concise progress reasoning suitable for the user interface.",
+        "Never claim a command, edit, test, or scheduled Job succeeded unless its tool result confirms it.",
+    ]
+    .join("\n")
+}
+
+fn persistent_job_prompt(job: &Job) -> String {
+    [
+        "# Persistent Job Brief".to_string(),
+        String::new(),
+        format!("Job: {}", job.name),
+        format!("ID: {}", job.id),
+        format!("Schedule: {}", job.schedule_description()),
+        String::new(),
+        "## Original Goal".to_string(),
+        job.goal.clone(),
+        String::new(),
+        "## Execution Contract".to_string(),
+        "Execute one useful scheduled run now. Inspect current state, perform the requested work, verify the result, and return a concise run summary.".to_string(),
+        "Do not assume access to the original conversation beyond this brief. If a required decision is missing, state the blocker and the exact question.".to_string(),
+        "Persist outputs in the repository or destination named by the goal. Do not create or use Tricks.".to_string(),
+    ]
+    .join("\n")
+}
+
+fn session_result(session: &Arc<Mutex<Session>>) -> String {
+    let session = session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    session
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            session::SessionMessage::Assistant(message) => {
+                let text = message
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        AssistantPart::Text(part) => Some(part.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!text.is_empty()).then_some(text)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| "The scheduled run produced no text result.".to_string())
 }
 
 #[cfg(test)]
