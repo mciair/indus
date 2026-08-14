@@ -62,6 +62,8 @@ pub struct Usage {
     pub reasoning_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub context_tokens: u64,
 }
 
 impl Usage {
@@ -189,6 +191,10 @@ impl CancellationToken {
 }
 
 pub trait ModelTransport: Send + Sync + 'static {
+    fn context_window(&self) -> Option<u64> {
+        None
+    }
+
     fn stream(
         &self,
         request: ModelRequest,
