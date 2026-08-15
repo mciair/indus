@@ -2,13 +2,14 @@ use std::{
     collections::{HashMap, VecDeque},
     ops::Range,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use ratatui::layout::Rect;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
+    features::{self, BrowserAction, BrowserItem},
     harness::{
         SessionMode, SessionSummary,
         event::{FileDiff, HarnessEvent, PermissionReply, RunOutcome},
@@ -66,6 +67,7 @@ pub struct HitZones {
     pub slash_rows: Vec<(Rect, usize)>,
     pub fold_rows: Vec<(Rect, usize)>,
     pub catalog_rows: Vec<(Rect, usize)>,
+    pub browser_rows: Vec<(Rect, usize)>,
     pub resume_rows: Vec<(Rect, usize)>,
 }
 
@@ -321,6 +323,22 @@ pub struct DeleteConfirmation {
     pub title: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserDetail {
+    pub title: String,
+    pub body: String,
+    pub scroll: usize,
+    pub action: BrowserAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserPanel {
+    pub title: String,
+    pub items: Vec<BrowserItem>,
+    pub selected: usize,
+    pub detail: Option<BrowserDetail>,
+}
+
 #[derive(Clone, Debug)]
 struct ModeSwitchBanner {
     message: String,
@@ -354,6 +372,12 @@ pub enum SessionCommand {
     SetMode(SessionMode),
     SessionInfo,
     Delete,
+    Fork,
+    Rewind,
+    Export(String),
+    Doctor,
+    Worktree,
+    SelectRelease(String),
 }
 
 pub struct App {
@@ -369,6 +393,7 @@ pub struct App {
     pub permission: Option<PermissionPrompt>,
     pub catalog_modal: Option<CatalogModal>,
     pub resume_panel: Option<ResumePanel>,
+    pub browser_panel: Option<BrowserPanel>,
     pub delete_confirmation: Option<DeleteConfirmation>,
     pub session_id: Option<String>,
     pub session_title: Option<String>,
@@ -376,6 +401,8 @@ pub struct App {
     pub running: bool,
     pub hit_zones: HitZones,
     pub session_mode: SessionMode,
+    pub multiline_mode: bool,
+    pub timestamps_enabled: bool,
     transcript_viewport: TranscriptViewport,
     transcript_scroll: usize,
     transcript_follow: bool,
@@ -386,6 +413,7 @@ pub struct App {
     queued_prompts: VecDeque<String>,
     pending_permission_reply: Option<(u64, PermissionReply)>,
     pending_session_command: Option<SessionCommand>,
+    transcript_times: Vec<i64>,
     mode_banner: Option<ModeSwitchBanner>,
     thinking_entries: HashMap<String, (usize, Instant)>,
     assistant_entries: HashMap<String, usize>,
@@ -416,6 +444,7 @@ impl App {
             permission: None,
             catalog_modal: None,
             resume_panel: None,
+            browser_panel: None,
             delete_confirmation: None,
             session_id: None,
             session_title: None,
@@ -423,6 +452,8 @@ impl App {
             running: true,
             hit_zones: HitZones::default(),
             session_mode: SessionMode::Normal,
+            multiline_mode: false,
+            timestamps_enabled: false,
             transcript_viewport: TranscriptViewport::default(),
             transcript_scroll: 0,
             transcript_follow: true,
@@ -433,6 +464,7 @@ impl App {
             queued_prompts: VecDeque::new(),
             pending_permission_reply: None,
             pending_session_command: None,
+            transcript_times: Vec::new(),
             mode_banner: None,
             thinking_entries: HashMap::new(),
             assistant_entries: HashMap::new(),
@@ -658,6 +690,148 @@ impl App {
         {
             selection.head = point;
         }
+    }
+
+    pub fn open_browser_catalog(&mut self, title: impl Into<String>, items: Vec<BrowserItem>) {
+        self.close_slash();
+        self.catalog_modal = None;
+        self.resume_panel = None;
+        self.browser_panel = Some(BrowserPanel {
+            title: title.into(),
+            items,
+            selected: 0,
+            detail: None,
+        });
+    }
+
+    pub fn open_document(&mut self, title: impl Into<String>, body: impl Into<String>) {
+        let title = title.into();
+        self.browser_panel = Some(BrowserPanel {
+            title: title.clone(),
+            items: Vec::new(),
+            selected: 0,
+            detail: Some(BrowserDetail {
+                title,
+                body: body.into(),
+                scroll: 0,
+                action: BrowserAction::None,
+            }),
+        });
+    }
+
+    pub fn close_browser_level(&mut self) {
+        let Some(panel) = self.browser_panel.as_mut() else {
+            return;
+        };
+        if panel.detail.take().is_some() && !panel.items.is_empty() {
+            return;
+        }
+        self.browser_panel = None;
+    }
+
+    pub fn move_browser_selection(&mut self, delta: isize) {
+        let Some(panel) = self.browser_panel.as_mut() else {
+            return;
+        };
+        if let Some(detail) = panel.detail.as_mut() {
+            detail.scroll = if delta.is_negative() {
+                detail.scroll.saturating_sub(delta.unsigned_abs())
+            } else {
+                detail.scroll.saturating_add(delta as usize)
+            };
+        } else if !panel.items.is_empty() {
+            panel.selected =
+                (panel.selected as isize + delta).rem_euclid(panel.items.len() as isize) as usize;
+        }
+    }
+
+    pub fn select_browser_index(&mut self, index: usize) {
+        if let Some(panel) = self.browser_panel.as_mut()
+            && panel.detail.is_none()
+            && index < panel.items.len()
+        {
+            panel.selected = index;
+        }
+    }
+
+    pub fn submit_browser_selection(&mut self) {
+        let Some(panel) = self.browser_panel.as_mut() else {
+            return;
+        };
+        if let Some(detail) = panel.detail.as_ref() {
+            match &detail.action {
+                BrowserAction::InsertSkill(name) => {
+                    let name = name.clone();
+                    self.browser_panel = None;
+                    self.composer.set(format!("${name} "));
+                    self.refresh_slash();
+                }
+                BrowserAction::SelectRelease(version) => {
+                    self.pending_session_command =
+                        Some(SessionCommand::SelectRelease(version.clone()));
+                }
+                BrowserAction::None => {}
+            }
+            return;
+        }
+        let Some(item) = panel.items.get(panel.selected).cloned() else {
+            return;
+        };
+        panel.detail = Some(BrowserDetail {
+            title: item.title,
+            body: item.body,
+            scroll: 0,
+            action: item.action,
+        });
+    }
+
+    pub fn transcript_markdown(&self) -> String {
+        let heading = self.session_title.as_deref().unwrap_or("Indus transcript");
+        let mut output = vec![format!("# {heading}")];
+        if let Some(id) = &self.session_id {
+            output.push(format!("\nSession: `{id}`"));
+        }
+        for entry in &self.transcript {
+            let (label, text) = transcript_entry_text(entry);
+            if text.trim().is_empty() {
+                continue;
+            }
+            output.push(format!("\n## {label}\n\n{text}"));
+        }
+        output.join("\n")
+    }
+
+    pub fn timeline_text(&mut self) -> String {
+        self.sync_transcript_timestamps();
+        self.transcript
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let (label, text) = transcript_entry_text(entry);
+                let summary = text.lines().next().unwrap_or_default();
+                format!(
+                    "{:>3}. {}  {:<10} {}",
+                    index + 1,
+                    format_timestamp(self.transcript_times[index]),
+                    label,
+                    summary
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn sync_transcript_timestamps(&mut self) {
+        let now = unix_seconds();
+        self.transcript_times.resize(self.transcript.len(), now);
+        self.transcript_times.truncate(self.transcript.len());
+    }
+
+    pub fn transcript_timestamp(&self, index: usize) -> Option<String> {
+        self.timestamps_enabled
+            .then(|| self.transcript_times.get(index).copied())
+            .flatten()
+            .map(format_timestamp)
     }
 
     pub fn open_provider_catalog(&mut self) {
@@ -1116,6 +1290,8 @@ impl App {
         self.composer.clear();
         self.close_slash();
         self.resume_panel = None;
+        self.browser_panel = None;
+        self.transcript_times.clear();
         self.session_id = session.is_allocated().then(|| session.id.clone());
         self.session_title = session.title.clone();
         self.queued_prompts.clear();
@@ -1193,6 +1369,7 @@ impl App {
         }
         self.transcript_follow = true;
         self.transcript_scroll = 0;
+        self.sync_transcript_timestamps();
     }
 
     pub fn report_session_error(&mut self, message: impl Into<String>) {
@@ -1239,13 +1416,11 @@ impl App {
 
     pub fn run_menu_action(&mut self, action: MenuAction) {
         match action {
-            MenuAction::Changelog => self
-                .transcript
-                .push(TranscriptEntry::Event("Changelog".to_string())),
+            MenuAction::Changelog => {
+                self.open_browser_catalog("Release notes", features::release_notes())
+            }
             MenuAction::Resume => self.pending_session_command = Some(SessionCommand::OpenResume),
-            MenuAction::Worktree => self
-                .transcript
-                .push(TranscriptEntry::Event("New Worktree".to_string())),
+            MenuAction::Worktree => self.pending_session_command = Some(SessionCommand::Worktree),
             MenuAction::Quit => self.running = false,
         }
     }
@@ -1560,8 +1735,20 @@ impl App {
         self.pending_submission = Some(text);
     }
 
+    fn submit_internal_prompt(&mut self, status: &str, prompt: &str) {
+        self.transcript
+            .push(TranscriptEntry::Event(status.to_string()));
+        if self.turn.is_some() {
+            self.queued_prompts.push_back(prompt.to_string());
+        } else {
+            self.turn = Some(ActiveTurn::new());
+            self.pending_submission = Some(prompt.to_string());
+        }
+    }
+
     pub fn on_tick(&mut self) {
         self.animation_tick = self.animation_tick.wrapping_add(1);
+        self.sync_transcript_timestamps();
         if self
             .mode_banner
             .as_ref()
@@ -1625,7 +1812,9 @@ impl App {
         match command.name {
             "quit" => self.running = false,
             "new" => self.pending_session_command = Some(SessionCommand::New),
+            "fork" => self.pending_session_command = Some(SessionCommand::Fork),
             "resume" => self.pending_session_command = Some(SessionCommand::OpenResume),
+            "rewind" => self.pending_session_command = Some(SessionCommand::Rewind),
             "edit-prompt" => self.pending_session_command = Some(SessionCommand::EditPrompt),
             "copy" => {
                 if let Some(response) = self.last_response() {
@@ -1672,6 +1861,11 @@ impl App {
                 self.pending_session_command = Some(SessionCommand::SetMode(mode));
             }
             "session-info" => self.pending_session_command = Some(SessionCommand::SessionInfo),
+            "export" => {
+                self.pending_session_command =
+                    Some(SessionCommand::Export(self.transcript_markdown()));
+            }
+            "doctor" => self.pending_session_command = Some(SessionCommand::Doctor),
             "delete" => {
                 if let Some(session_id) = self.session_id.clone() {
                     self.delete_confirmation = Some(DeleteConfirmation {
@@ -1691,6 +1885,133 @@ impl App {
                 self.transcript.clear();
                 self.turn = None;
             }
+            "transcript" => {
+                self.open_document("Full transcript", self.transcript_markdown());
+            }
+            "timeline" => {
+                let timeline = self.timeline_text();
+                self.open_document("Session timeline", timeline);
+            }
+            "find" => {
+                let query = args.to_lowercase();
+                let matches = self
+                    .transcript
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, entry)| {
+                        let (label, text) = transcript_entry_text(entry);
+                        text.to_lowercase().contains(&query).then(|| {
+                            format!(
+                                "{}. {} — {}",
+                                index + 1,
+                                label,
+                                text.lines().next().unwrap_or_default()
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                self.open_document(
+                    format!("Find: {args}"),
+                    if matches.is_empty() {
+                        "No matching transcript entries.".to_string()
+                    } else {
+                        matches.join("\n")
+                    },
+                );
+            }
+            "expand" => {
+                for entry in &mut self.transcript {
+                    match entry {
+                        TranscriptEntry::Thinking { expanded, .. }
+                        | TranscriptEntry::Tool { expanded, .. } => *expanded = true,
+                        _ => {}
+                    }
+                }
+                self.report_session_error("Expanded all reasoning and tool details.");
+            }
+            "multiline" => match parse_toggle(args, self.multiline_mode) {
+                Some(enabled) => {
+                    self.multiline_mode = enabled;
+                    self.report_session_error(if enabled {
+                        "Multiline input enabled. Press Ctrl+Enter to submit."
+                    } else {
+                        "Multiline input disabled. Press Enter to submit."
+                    });
+                }
+                None => self.report_session_error("Usage: /multiline [on|off]"),
+            },
+            "timestamps" => match parse_toggle(args, self.timestamps_enabled) {
+                Some(enabled) => {
+                    self.timestamps_enabled = enabled;
+                    self.sync_transcript_timestamps();
+                    self.report_session_error(if enabled {
+                        "Message timestamps enabled."
+                    } else {
+                        "Message timestamps disabled."
+                    });
+                }
+                None => self.report_session_error("Usage: /timestamps [on|off]"),
+            },
+            "privacy" => self.open_document(
+                "Privacy",
+                "Your prompts, code, API keys, and session history remain on this device. Indus does not collect or retain your data. Model requests are sent only to the Compatible Interim Provider you select.",
+            ),
+            "release-notes" => {
+                self.open_browser_catalog("Release notes", features::release_notes())
+            }
+            "mcps" => self.open_browser_catalog("MCP servers", features::mcp_catalog()),
+            "skills" => {
+                let items = features::installed_skills(&self.cwd);
+                if items.is_empty() {
+                    self.open_document("Skills", "No installed skills were found.");
+                } else {
+                    self.open_browser_catalog("Installed skills", items);
+                }
+            }
+            "history" => {
+                let prompts = self
+                    .transcript
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        TranscriptEntry::User { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .enumerate()
+                    .map(|(index, prompt)| format!("{}. {prompt}", index + 1))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.open_document(
+                    "Prompt history",
+                    if prompts.is_empty() {
+                        "No prompts in this session.".to_string()
+                    } else {
+                        prompts
+                    },
+                );
+            }
+            "queue" => self.open_document(
+                "Queued prompts",
+                if self.queued_prompts.is_empty() {
+                    "No prompts are queued.".to_string()
+                } else {
+                    self.queued_prompts
+                        .iter()
+                        .enumerate()
+                        .map(|(index, prompt)| format!("{}. {prompt}", index + 1))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                },
+            ),
+            "recap" => self.submit_internal_prompt(
+                "Generating a session recap…",
+                "Provide a concise recap of this session: summarize the goal, completed work, important decisions, current state, and clear next steps. Do not use tools unless needed to verify the current state.",
+            ),
+            "jobs" => self.submit_internal_prompt(
+                "Setting up Jobs…",
+                &format!(
+                    "Set up persistent Jobs for the following request. Use the job tool to create the required schedule and instructions, then confirm exactly what was scheduled:\n\n{args}"
+                ),
+            ),
             "theme" => {
                 let next = if args.is_empty() {
                     let current = ThemeKind::ALL
@@ -1720,6 +2041,47 @@ impl App {
         }
         true
     }
+}
+
+fn transcript_entry_text(entry: &TranscriptEntry) -> (&'static str, String) {
+    match entry {
+        TranscriptEntry::User { text, .. } => ("User", text.clone()),
+        TranscriptEntry::Thinking { text, .. } => ("Thinking", text.clone()),
+        TranscriptEntry::Assistant { text, .. } => ("Indus", text.clone()),
+        TranscriptEntry::Tool {
+            name,
+            input,
+            output,
+            ..
+        } => ("Tool", format!("{name}\nInput: {input}\nOutput: {output}")),
+        TranscriptEntry::Event(text) => ("Event", text.clone()),
+    }
+}
+
+fn parse_toggle(value: &str, current: bool) -> Option<bool> {
+    match value {
+        "" => Some(!current),
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn format_timestamp(timestamp: i64) -> String {
+    let seconds = timestamp.rem_euclid(86_400);
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3_600,
+        seconds % 3_600 / 60,
+        seconds % 60
+    )
 }
 
 fn byte_at_display_column(line: &str, column: usize) -> usize {
