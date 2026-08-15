@@ -37,7 +37,7 @@ use permission::{PermissionAction, PermissionError, PermissionRule, PermissionSe
 use persistence::SessionStore;
 pub use persistence::SessionSummary;
 use processor::{ProcessOutcome, StreamProcessor};
-use session::{AssistantPart, CompactionInput, Session};
+use session::{AssistantPart, CompactionInput, PENDING_SESSION_TITLE, Session};
 use tool::{ToolContext, ToolRegistry};
 use transport::ProviderTransport;
 
@@ -383,22 +383,55 @@ impl Harness {
         }
 
         let run_id = self.next_run_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let parent_id = {
+        let selection = crate::provider::ProviderStore::load()
+            .active_selection()
+            .cloned();
+        let provider_id = selection
+            .as_ref()
+            .map(|selection| format!("{:?}", selection.provider).to_lowercase());
+        let model_id = selection.map(|selection| selection.model_id);
+        let (parent_id, allocated_session_id) = {
             let mut session = self
                 .session
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let id = session.push_user(prompt.clone());
+            let allocated_session_id = if session.is_allocated() || self.session_store.is_none() {
+                None
+            } else {
+                let session_id = generate_session_id();
+                session
+                    .allocate_pending(session_id.clone(), provider_id, model_id)
+                    .then_some(session_id)
+            };
             if let Some(store) = &self.session_store {
                 let _ = store.save(&session);
             }
-            id
+            (id, allocated_session_id)
         };
         let cancellation = CancellationToken::default();
         *self
             .cancellation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cancellation.clone());
+
+        if let Some(session_id) = allocated_session_id {
+            let _ = self.event_tx.send(HarnessEvent::SessionCreated {
+                run_id,
+                session_id: session_id.clone(),
+                title: PENDING_SESSION_TITLE.to_string(),
+            });
+            spawn_session_title_generation(SessionTitleTask {
+                transport: Arc::clone(&self.transport),
+                session: Arc::clone(&self.session),
+                store: self.session_store.clone(),
+                events: self.event_tx.clone(),
+                cancellation: CancellationToken::default(),
+                run_id,
+                session_id,
+                first_prompt: prompt.clone(),
+            });
+        }
 
         let runtime = Runtime {
             transport: Arc::clone(&self.transport),
@@ -414,9 +447,7 @@ impl Harness {
         let busy = Arc::clone(&self.busy);
         let active_cancellation = Arc::clone(&self.cancellation);
         thread::spawn(move || {
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                runtime.run(run_id, parent_id, Some(&prompt))
-            }));
+            let result = catch_unwind(AssertUnwindSafe(|| runtime.run(run_id, parent_id)));
             if result.is_err() {
                 let _ = runtime.events.send(HarnessEvent::RunError {
                     run_id,
@@ -591,7 +622,7 @@ impl Harness {
                 job_id: job.id.clone(),
                 name: job.name.clone(),
             });
-            let outcome = catch_unwind(AssertUnwindSafe(|| runtime.run(run_id, parent_id, None)))
+            let outcome = catch_unwind(AssertUnwindSafe(|| runtime.run(run_id, parent_id)))
                 .unwrap_or(RunOutcome::Failed);
             let succeeded = outcome == RunOutcome::Completed;
             let result = session_result(&session);
@@ -639,7 +670,7 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn run(&self, run_id: u64, parent_id: u64, user_prompt: Option<&str>) -> RunOutcome {
+    fn run(&self, run_id: u64, parent_id: u64) -> RunOutcome {
         self.emit(HarnessEvent::RunStarted { run_id });
 
         'steps: for step in 1..=self.config.max_steps.max(1) {
@@ -751,9 +782,6 @@ impl Runtime {
                 return self.finish(run_id, RunOutcome::CompactionRequired);
             }
             if outcome == ProcessOutcome::Stop {
-                if let Some(goal) = user_prompt {
-                    self.ensure_session_identity(run_id, goal);
-                }
                 return self.finish(run_id, RunOutcome::Completed);
             }
         }
@@ -997,88 +1025,6 @@ impl Runtime {
         }
     }
 
-    fn ensure_session_identity(&self, run_id: u64, fallback_prompt: &str) {
-        let Some(store) = &self.session_store else {
-            return;
-        };
-        let first_prompt = {
-            let session = self
-                .session
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if session.is_allocated() {
-                return;
-            }
-            session
-                .messages
-                .iter()
-                .find_map(|message| match message {
-                    session::SessionMessage::User(message)
-                        if !message.text.starts_with("[Conversation summary]") =>
-                    {
-                        Some(message.text.clone())
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| fallback_prompt.to_string())
-        };
-
-        let request = ModelRequest {
-            system: vec![
-                "Name this coding session with a short, distinctive title of 5 to 10 words. Use concrete nouns and verbs from the user's request. Do not use quotation marks, markdown, a trailing period, or generic labels such as New Session. Return only the title."
-                    .to_string(),
-            ],
-            messages: vec![ModelMessage {
-                role: Role::User,
-                content: vec![ModelContent::Text(first_prompt)],
-            }],
-            tools: Vec::new(),
-            step: 0,
-        };
-        let mut generated = String::new();
-        let result = self.transport.stream(
-            request,
-            &mut |event| {
-                if let model::ModelEvent::TextDelta { text, .. } = event {
-                    generated.push_str(&text);
-                }
-                Ok(())
-            },
-            &self.cancellation,
-        );
-        let Some(title) = result.ok().and_then(|_| sanitize_session_title(&generated)) else {
-            return;
-        };
-        let selection = crate::provider::ProviderStore::load()
-            .active_selection()
-            .cloned();
-        let provider_id = selection
-            .as_ref()
-            .map(|selection| format!("{:?}", selection.provider).to_lowercase());
-        let model_id = selection.map(|selection| selection.model_id);
-        let id = generate_session_id();
-        let mut session = self
-            .session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !session.allocate(id.clone(), title.clone(), provider_id, model_id) {
-            return;
-        }
-        if store.save(&session).is_err() {
-            session.id.clear();
-            session.title = None;
-            session.created_at = 0;
-            session.updated_at = 0;
-            return;
-        }
-        drop(session);
-        self.emit(HarnessEvent::SessionCreated {
-            run_id,
-            session_id: id,
-            title,
-        });
-    }
-
     fn emit(&self, event: HarnessEvent) {
         let _ = self.events.send(event);
     }
@@ -1087,6 +1033,72 @@ impl Runtime {
         self.emit(HarnessEvent::RunFinished { run_id, outcome });
         outcome
     }
+}
+
+struct SessionTitleTask {
+    transport: Arc<dyn ModelTransport>,
+    session: Arc<Mutex<Session>>,
+    store: Option<SessionStore>,
+    events: Sender<HarnessEvent>,
+    cancellation: CancellationToken,
+    run_id: u64,
+    session_id: String,
+    first_prompt: String,
+}
+
+fn spawn_session_title_generation(task: SessionTitleTask) {
+    thread::spawn(move || {
+        let _ = catch_unwind(AssertUnwindSafe(|| generate_session_title(task)));
+    });
+}
+
+fn generate_session_title(task: SessionTitleTask) {
+    let request = ModelRequest {
+        system: vec![
+            "Name this coding session with a short, distinctive title of 5 to 10 words. Use concrete nouns and verbs from the user's request. Do not use quotation marks, markdown, a trailing period, or generic labels such as New Session. Return only the title."
+                .to_string(),
+        ],
+        messages: vec![ModelMessage {
+            role: Role::User,
+            content: vec![ModelContent::Text(task.first_prompt)],
+        }],
+        tools: Vec::new(),
+        step: 0,
+    };
+    let mut generated = String::new();
+    let result = task.transport.stream(
+        request,
+        &mut |event| {
+            if let model::ModelEvent::TextDelta { text, .. } = event {
+                generated.push_str(&text);
+            }
+            Ok(())
+        },
+        &task.cancellation,
+    );
+    let Some(title) = result.ok().and_then(|_| sanitize_session_title(&generated)) else {
+        return;
+    };
+
+    let mut session = task
+        .session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if session.id != task.session_id || !session.apply_generated_title(title.clone()) {
+        return;
+    }
+    if let Some(store) = &task.store
+        && store.save(&session).is_err()
+    {
+        session.title = Some(PENDING_SESSION_TITLE.to_string());
+        return;
+    }
+    drop(session);
+    let _ = task.events.send(HarnessEvent::SessionTitleUpdated {
+        run_id: task.run_id,
+        session_id: task.session_id,
+        title,
+    });
 }
 
 fn sanitize_session_title(value: &str) -> Option<String> {
@@ -1300,7 +1312,10 @@ fn session_result(session: &Arc<Mutex<Session>>) -> String {
 mod tests {
     use std::{
         fs,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Condvar,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
@@ -1349,6 +1364,48 @@ mod tests {
                 ("title", "Inspect Repository Status and Dependencies")
             } else {
                 ("answer", "The repository is ready.")
+            };
+            on_event(ModelEvent::TextStarted { id: id.into() })?;
+            on_event(ModelEvent::TextDelta {
+                id: id.into(),
+                text: text.into(),
+            })?;
+            on_event(ModelEvent::TextFinished { id: id.into() })?;
+            on_event(ModelEvent::StepFinished {
+                reason: StopReason::Stop,
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    struct DeferredTitleTransport {
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl ModelTransport for DeferredTitleTransport {
+        fn stream(
+            &self,
+            request: ModelRequest,
+            on_event: &mut dyn FnMut(ModelEvent) -> Result<(), TransportError>,
+            cancellation: &CancellationToken,
+        ) -> Result<(), TransportError> {
+            cancellation.check()?;
+            let (id, text) = if request.step == 0 {
+                let (released, wake) = &*self.release;
+                let mut released = released
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                while !*released {
+                    let waited = wake.wait_timeout(released, Duration::from_millis(10));
+                    released = match waited {
+                        Ok((released, _)) => released,
+                        Err(poisoned) => poisoned.into_inner().0,
+                    };
+                    cancellation.check()?;
+                }
+                ("title", "Concurrent Selected Model Title")
+            } else {
+                ("answer", "Visible response completed.")
             };
             on_event(ModelEvent::TextStarted { id: id.into() })?;
             on_event(ModelEvent::TextDelta {
@@ -1454,6 +1511,9 @@ mod tests {
             if events
                 .iter()
                 .any(|event| matches!(event, HarnessEvent::RunFinished { .. }))
+                && events
+                    .iter()
+                    .any(|event| matches!(event, HarnessEvent::SessionTitleUpdated { .. }))
             {
                 break;
             }
@@ -1665,6 +1725,90 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event,
             HarnessEvent::SessionCreated { session_id, .. } if session_id == &session.id
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HarnessEvent::SessionTitleUpdated { session_id, .. } if session_id == &session.id
+        )));
+        drop(harness);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn visible_turn_finishes_without_waiting_for_the_selected_model_title() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("indus-title-lifecycle-{unique}"));
+        let store = SessionStore::at(root.join("indus.db")).unwrap();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut harness = Harness::new(
+            Arc::new(DeferredTitleTransport {
+                release: Arc::clone(&release),
+            }),
+            ToolRegistry::default(),
+            PermissionService::default(),
+            HarnessConfig::default(),
+        );
+        harness.session_store = Some(store.clone());
+        harness.submit("complete the visible turn first").unwrap();
+
+        let provisional = harness.session_snapshot();
+        assert!(provisional.id.starts_with("ses-i_"));
+        assert_eq!(provisional.title.as_deref(), Some(PENDING_SESSION_TITLE));
+        assert!(store.load(&provisional.id).unwrap().is_some());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut events = Vec::new();
+        while Instant::now() < deadline {
+            events.extend(harness.drain_events());
+            if events
+                .iter()
+                .any(|event| matches!(event, HarnessEvent::RunFinished { .. }))
+            {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, HarnessEvent::RunFinished { .. }))
+        );
+        assert!(!harness.is_busy());
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, HarnessEvent::SessionTitleUpdated { .. }))
+        );
+
+        let (released, wake) = &*release;
+        *released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        wake.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            events.extend(harness.drain_events());
+            if events
+                .iter()
+                .any(|event| matches!(event, HarnessEvent::SessionTitleUpdated { .. }))
+            {
+                break;
+            }
+            thread::yield_now();
+        }
+
+        let titled = harness.session_snapshot();
+        assert_eq!(
+            titled.title.as_deref(),
+            Some("Concurrent Selected Model Title")
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HarnessEvent::SessionTitleUpdated { session_id, .. }
+                if session_id == &titled.id
         )));
         drop(harness);
         let _ = fs::remove_dir_all(root);
