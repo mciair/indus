@@ -178,7 +178,6 @@ pub static COMMANDS: &[SlashCommand] = &[
         true,
         ArgumentSource::None,
     ),
-    SlashCommand::plain("dashboard", "Open the session dashboard", "/dashboard"),
     SlashCommand::with_args(
         "cd",
         "Change working directory",
@@ -264,7 +263,6 @@ pub static COMMANDS: &[SlashCommand] = &[
         "Configure project agents",
         "/config-agents",
     ),
-    SlashCommand::plain("personas", "Manage personas", "/personas"),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -569,5 +567,16 @@ mod tests {
         let rows = command_suggestions("thm");
         assert_eq!(rows.first().map(|row| row.display.as_str()), Some("/theme"));
         assert!(!rows[0].matched_indices.is_empty());
+    }
+
+    #[test]
+    fn unavailable_persona_and_dashboard_commands_are_hidden() {
+        let names = COMMANDS
+            .iter()
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"personas"));
+        assert!(!names.contains(&"dashboard"));
+        assert!(names.contains(&"compact"));
     }
 }
