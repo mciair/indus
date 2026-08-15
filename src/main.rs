@@ -6,6 +6,7 @@ mod theme;
 mod ui;
 
 use std::{
+    collections::VecDeque,
     env,
     io::{self, Write},
     process::{Command, Stdio},
@@ -22,19 +23,19 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use harness::{Harness, event::PermissionReply};
+use harness::{Harness, HarnessError, event::PermissionReply};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use slash::CompletionPhase;
 
 fn main() -> Result<()> {
     let resume_id = parse_resume_argument()?;
-    let harness = Harness::configured_with_session(resume_id.as_deref())?;
+    let mut harness = Harness::configured_with_session(resume_id.as_deref())?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let result = run(&mut terminal, &harness);
+    let result = run(&mut terminal, &mut harness);
     let session = harness.session_snapshot();
     disable_raw_mode()?;
     execute!(
@@ -57,8 +58,14 @@ fn resume_hint(session: &harness::session::Session) -> Option<String> {
         .then(|| format!("Resume this session:\n  indus --resume {}", session.id))
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, harness: &Harness) -> Result<()> {
+struct BackgroundHarness {
+    harness: Harness,
+    queued_prompts: VecDeque<String>,
+}
+
+fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, harness: &mut Harness) -> Result<()> {
     let mut app = App::new();
+    let mut background_harnesses = Vec::new();
     let session = harness.session_snapshot();
     if session.is_allocated() {
         app.load_session(&session);
@@ -69,6 +76,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, harness: &Harness)
         for event in harness.drain_events() {
             app.apply_harness_event(event);
         }
+        poll_background_harnesses(&mut background_harnesses);
         terminal.draw(|frame| ui::render(frame, &mut app))?;
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
@@ -80,10 +88,26 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, harness: &Harness)
                 _ => {}
             }
         }
-        dispatch_app_commands(&mut app, harness);
+        dispatch_app_commands(&mut app, harness, &mut background_harnesses);
         app.on_tick();
     }
     Ok(())
+}
+
+fn poll_background_harnesses(backgrounds: &mut Vec<BackgroundHarness>) {
+    for background in backgrounds.iter_mut() {
+        let _ = background.harness.drain_events();
+        if !background.harness.is_busy()
+            && let Some(prompt) = background.queued_prompts.pop_front()
+            && let Err(error) = background.harness.submit(prompt.clone())
+        {
+            if error == HarnessError::Busy {
+                background.queued_prompts.push_front(prompt);
+            }
+        }
+    }
+    backgrounds
+        .retain(|background| background.harness.is_busy() || !background.queued_prompts.is_empty());
 }
 
 fn handle_key(app: &mut App, harness: &Harness, key: KeyEvent) {
@@ -446,7 +470,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     }
 }
 
-fn dispatch_app_commands(app: &mut App, harness: &Harness) {
+fn dispatch_app_commands(
+    app: &mut App,
+    harness: &mut Harness,
+    backgrounds: &mut Vec<BackgroundHarness>,
+) {
     if let Some(command) = app.take_session_command() {
         match command {
             SessionCommand::OpenResume => match harness.list_sessions(None) {
@@ -461,12 +489,35 @@ fn dispatch_app_commands(app: &mut App, harness: &Harness) {
                     app.report_session_error(format!("Could not resume {session_id}: {error:#}"))
                 }
             },
-            SessionCommand::New => match harness.new_session() {
-                Ok(session) => app.load_session(&session),
-                Err(error) => {
-                    app.report_session_error(format!("Could not start a new session: {error:#}"))
+            SessionCommand::New => {
+                if harness.is_busy() {
+                    match Harness::configured() {
+                        Ok(replacement) => {
+                            let mode = harness.mode();
+                            let _ = replacement.set_mode(mode);
+                            let previous = std::mem::replace(harness, replacement);
+                            backgrounds.push(BackgroundHarness {
+                                harness: previous,
+                                queued_prompts: app.take_queued_prompts(),
+                            });
+                            app.load_session(&harness.session_snapshot());
+                            app.report_session_error(
+                                "The previous session is continuing in the background.",
+                            );
+                        }
+                        Err(error) => app.report_session_error(format!(
+                            "Could not start a new session: {error:#}"
+                        )),
+                    }
+                } else {
+                    match harness.new_session() {
+                        Ok(session) => app.load_session(&session),
+                        Err(error) => app.report_session_error(format!(
+                            "Could not start a new session: {error:#}"
+                        )),
+                    }
                 }
-            },
+            }
             SessionCommand::EditPrompt => match harness.edit_previous_prompt() {
                 Ok((session, prompt)) => app.restore_edited_prompt(&session, prompt),
                 Err(error) => app
@@ -515,17 +566,21 @@ fn dispatch_app_commands(app: &mut App, harness: &Harness) {
             },
         }
     }
-    if let Some(prompt) = app.take_submission()
-        && let Err(error) = harness.submit(prompt)
-    {
-        app.apply_harness_event(harness::event::HarnessEvent::RunError {
-            run_id: 0,
-            message: error.to_string(),
-        });
-        app.apply_harness_event(harness::event::HarnessEvent::RunFinished {
-            run_id: 0,
-            outcome: harness::event::RunOutcome::Failed,
-        });
+    if let Some(prompt) = app.take_submission() {
+        match harness.submit(prompt.clone()) {
+            Ok(_) => {}
+            Err(HarnessError::Busy) => app.restore_submission(prompt),
+            Err(error) => {
+                app.apply_harness_event(harness::event::HarnessEvent::RunError {
+                    run_id: 0,
+                    message: error.to_string(),
+                });
+                app.apply_harness_event(harness::event::HarnessEvent::RunFinished {
+                    run_id: 0,
+                    outcome: harness::event::RunOutcome::Failed,
+                });
+            }
+        }
     }
     if let Some((request_id, reply)) = app.take_permission_reply() {
         harness.reply_permission(request_id, reply);
