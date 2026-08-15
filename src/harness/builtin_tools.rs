@@ -17,7 +17,7 @@ use similar::{ChangeTag, TextDiff};
 
 use super::{
     event::{DiffKind, DiffLine, FileDiff},
-    jobs::JobService,
+    jobs::{JobSchedule, JobService},
     model::ToolDefinition,
     tool::{HarnessTool, ToolContext, ToolError, ToolOutput, ToolPermission, ToolRegistry},
 };
@@ -964,18 +964,39 @@ struct JobInput {
     action: String,
     #[serde(default)]
     job_id: Option<String>,
+    #[serde(default)]
+    goal: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    schedule_type: Option<String>,
+    #[serde(default)]
+    interval_ms: Option<u64>,
+    #[serde(default)]
+    clock_times: Vec<String>,
+    #[serde(default)]
+    time_zone: Option<String>,
+    #[serde(default)]
+    cron_expr: Option<String>,
 }
 
 impl HarnessTool for JobTool {
     fn definition(&self) -> ToolDefinition {
         definition(
             "job",
-            "List, inspect, pause, resume, or complete persistent Jobs created by the classifier.",
+            "Create, list, inspect, pause, resume, or complete persistent scheduled Jobs.",
             json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["list", "get", "pause", "resume", "complete"] },
-                    "job_id": { "type": "string" }
+                    "action": { "type": "string", "enum": ["create", "list", "get", "pause", "resume", "complete"] },
+                    "job_id": { "type": "string" },
+                    "goal": { "type": "string", "description": "Complete standalone instructions for a new Job" },
+                    "name": { "type": "string", "description": "Short descriptive Job name" },
+                    "schedule_type": { "type": "string", "enum": ["interval", "clock_based", "cron", "24_7"] },
+                    "interval_ms": { "type": "integer", "minimum": 1000 },
+                    "clock_times": { "type": "array", "items": { "type": "string", "description": "HH:mm" } },
+                    "time_zone": { "type": "string", "description": "IANA time zone" },
+                    "cron_expr": { "type": "string" }
                 },
                 "required": ["action"]
             }),
@@ -993,6 +1014,50 @@ impl HarnessTool for JobTool {
     fn execute(&self, input: &str, _context: &ToolContext) -> Result<ToolOutput, ToolError> {
         let input: JobInput = parse(input)?;
         let job = match input.action.as_str() {
+            "create" => {
+                let goal = input
+                    .goal
+                    .filter(|goal| !goal.trim().is_empty())
+                    .ok_or_else(|| ToolError::new("goal is required for create"))?;
+                let name = input
+                    .name
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        goal.split_whitespace()
+                            .take(8)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    });
+                let schedule = match input.schedule_type.as_deref() {
+                    Some("interval") => JobSchedule::Interval {
+                        interval_ms: input.interval_ms.unwrap_or(60_000).max(1_000),
+                    },
+                    Some("clock_based") => {
+                        if input.clock_times.is_empty() {
+                            return Err(ToolError::new(
+                                "clock_times is required for a clock_based schedule",
+                            ));
+                        }
+                        JobSchedule::ClockBased {
+                            clock_times: input.clock_times,
+                            time_zone: input.time_zone,
+                        }
+                    }
+                    Some("cron") => JobSchedule::Cron {
+                        cron_expr: input
+                            .cron_expr
+                            .filter(|value| !value.trim().is_empty())
+                            .ok_or_else(|| ToolError::new("cron_expr is required for cron"))?,
+                    },
+                    Some("24_7") | None => JobSchedule::Continuous,
+                    Some(value) => {
+                        return Err(ToolError::new(format!(
+                            "Unknown Job schedule type: {value}"
+                        )));
+                    }
+                };
+                Some(self.jobs.create(goal, name, schedule).map_err(tool_error)?)
+            }
             "list" => {
                 let jobs = self.jobs.list();
                 let output = if jobs.is_empty() {
