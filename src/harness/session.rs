@@ -114,6 +114,8 @@ pub struct Session {
     pub created_at: i64,
     #[serde(default)]
     pub updated_at: i64,
+    #[serde(default)]
+    pub ephemeral: bool,
     pub messages: Vec<SessionMessage>,
     #[serde(default)]
     next_message_id: u64,
@@ -131,6 +133,7 @@ impl Session {
             model_id: None,
             created_at: timestamp,
             updated_at: timestamp,
+            ephemeral: false,
             messages: Vec::new(),
             next_message_id: 0,
         }
@@ -169,13 +172,15 @@ impl Session {
             model_id,
             created_at,
             updated_at,
+            ephemeral: false,
             messages,
             next_message_id,
         }
     }
 
     pub fn is_allocated(&self) -> bool {
-        self.id.starts_with("ses-i_")
+        !self.ephemeral
+            && self.id.starts_with("ses-i_")
             && self
                 .title
                 .as_deref()
@@ -189,7 +194,7 @@ impl Session {
         provider_id: Option<String>,
         model_id: Option<String>,
     ) -> bool {
-        if self.is_allocated() {
+        if self.is_allocated() || self.ephemeral {
             return false;
         }
         let title = title.into().trim().to_string();
@@ -205,6 +210,19 @@ impl Session {
         self.created_at = timestamp;
         self.updated_at = timestamp;
         true
+    }
+
+    pub fn ephemeral_fork(&self) -> Self {
+        let mut fork = self.clone();
+        fork.id.clear();
+        fork.title = Some(match self.title.as_deref() {
+            Some(title) => format!("Fork of {title}"),
+            None => "Ephemeral fork".to_string(),
+        });
+        fork.created_at = 0;
+        fork.updated_at = 0;
+        fork.ephemeral = true;
+        fork
     }
 
     pub fn rename(&mut self, title: impl Into<String>) -> bool {
@@ -584,6 +602,20 @@ mod tests {
         assert!(session.allocate("ses-i_example", "Initial", None, None));
         assert!(session.rename("Renamed Session"));
         assert_eq!(session.title.as_deref(), Some("Renamed Session"));
+    }
+
+    #[test]
+    fn ephemeral_forks_clone_history_without_becoming_persistable() {
+        let mut session = Session::unallocated("/workspace");
+        assert!(session.allocate("ses-i_parent", "Parent", None, None));
+        session.push_user("preserved history");
+
+        let mut fork = session.ephemeral_fork();
+        assert!(fork.ephemeral);
+        assert!(!fork.is_allocated());
+        assert_eq!(fork.title.as_deref(), Some("Fork of Parent"));
+        assert_eq!(fork.messages, session.messages);
+        assert!(!fork.allocate("ses-i_fork", "Fork", None, None));
     }
 
     #[test]
