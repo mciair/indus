@@ -8,6 +8,8 @@ use super::{
     model::{ModelContent, ModelMessage, Role, StopReason, Usage},
 };
 
+pub const PENDING_SESSION_TITLE: &str = "New session";
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UserMessage {
     pub id: u64,
@@ -204,6 +206,32 @@ impl Session {
         self.model_id = model_id;
         self.created_at = timestamp;
         self.updated_at = timestamp;
+        true
+    }
+
+    pub fn allocate_pending(
+        &mut self,
+        id: impl Into<String>,
+        provider_id: Option<String>,
+        model_id: Option<String>,
+    ) -> bool {
+        self.allocate(id, PENDING_SESSION_TITLE, provider_id, model_id)
+    }
+
+    pub fn needs_generated_title(&self) -> bool {
+        self.is_allocated() && self.title.as_deref() == Some(PENDING_SESSION_TITLE)
+    }
+
+    pub fn apply_generated_title(&mut self, title: impl Into<String>) -> bool {
+        if !self.needs_generated_title() {
+            return false;
+        }
+        let title = title.into().trim().to_string();
+        if title.is_empty() {
+            return false;
+        }
+        self.title = Some(title);
+        self.touch();
         true
     }
 
@@ -576,6 +604,26 @@ mod tests {
         assert!(session.allocate("ses-i_example", "Initial", None, None));
         assert!(session.rename("Renamed Session"));
         assert_eq!(session.title.as_deref(), Some("Renamed Session"));
+    }
+
+    #[test]
+    fn pending_sessions_accept_one_generated_title_without_overwriting_renames() {
+        let mut session = Session::unallocated("/workspace");
+        assert!(session.allocate_pending(
+            "ses-i_example",
+            Some("provider".into()),
+            Some("model".into())
+        ));
+        assert!(session.needs_generated_title());
+        assert!(session.apply_generated_title("Generated Title"));
+        assert_eq!(session.title.as_deref(), Some("Generated Title"));
+        assert!(!session.apply_generated_title("Replacement"));
+
+        let mut renamed = Session::unallocated("/workspace");
+        assert!(renamed.allocate_pending("ses-i_renamed", None, None));
+        assert!(renamed.rename("User Title"));
+        assert!(!renamed.apply_generated_title("Late Generated Title"));
+        assert_eq!(renamed.title.as_deref(), Some("User Title"));
     }
 
     #[test]
