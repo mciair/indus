@@ -35,6 +35,7 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = run(&mut terminal, &harness);
+    let session = harness.session_snapshot();
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -42,7 +43,18 @@ fn main() -> Result<()> {
         DisableMouseCapture
     )?;
     terminal.show_cursor()?;
+    if result.is_ok()
+        && let Some(hint) = resume_hint(&session)
+    {
+        writeln!(io::stdout(), "{hint}")?;
+    }
     result
+}
+
+fn resume_hint(session: &harness::session::Session) -> Option<String> {
+    session
+        .is_allocated()
+        .then(|| format!("Resume this session:\n  indus --resume {}", session.id))
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, harness: &Harness) -> Result<()> {
@@ -630,12 +642,29 @@ fn encode_base64(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_base64;
+    use super::{encode_base64, resume_hint};
+    use crate::harness::session::Session;
 
     #[test]
     fn osc52_payload_uses_standard_base64_padding() {
         assert_eq!(encode_base64(b"Indus"), "SW5kdXM=");
         assert_eq!(encode_base64(b"AI"), "QUk=");
         assert_eq!(encode_base64(b"CLI"), "Q0xJ");
+    }
+
+    #[test]
+    fn allocated_sessions_print_an_exact_resume_command() {
+        let mut session = Session::unallocated("/workspace");
+        assert!(session.allocate("ses-i_example", "Example Session", None, None));
+
+        assert_eq!(
+            resume_hint(&session).as_deref(),
+            Some("Resume this session:\n  indus --resume ses-i_example")
+        );
+    }
+
+    #[test]
+    fn unallocated_conversations_do_not_print_a_resume_command() {
+        assert_eq!(resume_hint(&Session::unallocated("/workspace")), None);
     }
 }
