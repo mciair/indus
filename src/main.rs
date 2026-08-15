@@ -102,10 +102,9 @@ fn poll_background_harnesses(backgrounds: &mut Vec<BackgroundHarness>) {
         if !background.harness.is_busy()
             && let Some(prompt) = background.queued_prompts.pop_front()
             && let Err(error) = background.harness.submit(prompt.clone())
+            && error == HarnessError::Busy
         {
-            if error == HarnessError::Busy {
-                background.queued_prompts.push_front(prompt);
-            }
+            background.queued_prompts.push_front(prompt);
         }
     }
     backgrounds
@@ -759,10 +758,11 @@ fn doctor_report(app: &App, harness: &Harness) -> String {
         format!("Model: {model}"),
         format!(
             "Session: {}",
-            session
-                .is_allocated()
-                .then_some(session.id.as_str())
-                .unwrap_or("Not allocated yet")
+            if session.is_allocated() {
+                session.id.as_str()
+            } else {
+                "Not allocated yet"
+            }
         ),
         format!("Mode: {}", harness.mode().label()),
         format!("Context tokens: {}", session.current_context_tokens()),
