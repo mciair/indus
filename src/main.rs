@@ -83,6 +83,26 @@ fn handle_key(app: &mut App, harness: &Harness, key: KeyEvent) {
         open_alpha();
         return;
     }
+    if app.delete_confirmation.is_some() {
+        if key.modifiers.is_empty() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    app.confirm_delete();
+                }
+                KeyCode::Char('n') | KeyCode::Esc => app.cancel_delete(),
+                _ => {}
+            }
+        }
+        return;
+    }
+    if is_mode_cycle_key(key)
+        && app.resume_panel.is_none()
+        && app.catalog_modal.is_none()
+        && app.permission.is_none()
+    {
+        app.request_next_mode();
+        return;
+    }
     if app.resume_panel.is_some() {
         handle_resume_key(app, key);
         return;
@@ -211,6 +231,11 @@ fn handle_resume_key(app: &mut App, key: KeyEvent) {
         }
         _ => {}
     }
+}
+
+fn is_mode_cycle_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::BackTab)
+        || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
 }
 
 fn handle_catalog_key(app: &mut App, key: KeyEvent) {
@@ -446,6 +471,34 @@ fn dispatch_app_commands(app: &mut App, harness: &Harness) {
                 }
                 Err(error) => {
                     app.report_session_error(format!("Could not rename the session: {error:#}"))
+                }
+            },
+            SessionCommand::Compact(instructions) => {
+                if let Err(error) = harness.compact_context(instructions) {
+                    app.apply_harness_event(harness::event::HarnessEvent::RunError {
+                        run_id: 0,
+                        message: format!("Could not compact the conversation: {error:#}"),
+                    });
+                    app.apply_harness_event(harness::event::HarnessEvent::RunFinished {
+                        run_id: 0,
+                        outcome: harness::event::RunOutcome::Failed,
+                    });
+                }
+            }
+            SessionCommand::SetMode(mode) => match harness.set_mode(mode) {
+                Ok(()) => app.confirm_mode(mode),
+                Err(error) => {
+                    app.report_session_error(format!("Could not switch modes: {error:#}"))
+                }
+            },
+            SessionCommand::SessionInfo => app.report_session_info(harness.session_info()),
+            SessionCommand::Delete => match harness.delete_session() {
+                Ok((session, deleted_id)) => {
+                    app.load_session(&session);
+                    app.report_session_error(format!("Deleted session {deleted_id}."));
+                }
+                Err(error) => {
+                    app.report_session_error(format!("Could not delete the session: {error:#}"))
                 }
             },
         }
