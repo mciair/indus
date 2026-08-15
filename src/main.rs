@@ -170,6 +170,11 @@ fn handle_key(app: &mut App, harness: &Harness, key: KeyEvent) {
         }
         return;
     }
+    if key.code == KeyCode::Esc && app.turn.is_some() && app.has_queued_prompts() {
+        harness.cancel();
+        app.cancel_turn();
+        return;
+    }
     if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
         if app.turn.is_some() {
             harness.cancel();
