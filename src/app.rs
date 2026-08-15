@@ -2308,6 +2308,74 @@ mod tests {
     }
 
     #[test]
+    fn session_utility_commands_open_working_surfaces() {
+        let mut app = App::new();
+        app.composer.set("/release-notes");
+        app.submit();
+        assert!(app.browser_panel.as_ref().is_some_and(|panel| {
+            panel.title == "Release notes" && panel.items[0].title == "Indus v0.1.0"
+        }));
+
+        app.browser_panel = None;
+        app.composer.set("/privacy");
+        app.submit();
+        assert!(app.browser_panel.as_ref().is_some_and(|panel| {
+            panel
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.body.contains("does not collect"))
+        }));
+
+        app.browser_panel = None;
+        app.composer.set("/mcps");
+        app.submit();
+        assert!(
+            app.browser_panel
+                .as_ref()
+                .is_some_and(|panel| { panel.items.iter().any(|item| item.title == "Exa Search") })
+        );
+    }
+
+    #[test]
+    fn jobs_require_instructions_and_submit_a_job_tool_request() {
+        let mut app = App::new();
+        app.composer.set("/jobs");
+        app.submit();
+        assert!(app.take_submission().is_none());
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptEntry::Event(message)) if message == "Usage: /jobs <instructions>"
+        ));
+
+        app.composer.set("/jobs every weekday summarize changes");
+        app.submit();
+        assert!(
+            app.take_submission()
+                .is_some_and(|prompt| prompt.contains("Use the job tool"))
+        );
+    }
+
+    #[test]
+    fn multiline_timestamps_fork_and_rewind_commands_change_real_state() {
+        let mut app = App::new();
+        app.composer.set("/multiline on");
+        app.submit();
+        assert!(app.multiline_mode);
+
+        app.composer.set("/timestamps on");
+        app.submit();
+        assert!(app.timestamps_enabled);
+
+        app.composer.set("/fork");
+        app.submit();
+        assert_eq!(app.take_session_command(), Some(SessionCommand::Fork));
+
+        app.composer.set("/rewind");
+        app.submit();
+        assert_eq!(app.take_session_command(), Some(SessionCommand::Rewind));
+    }
+
+    #[test]
     fn delete_requires_confirmation_for_an_allocated_session() {
         let mut app = App::new();
         app.session_id = Some("ses-i_example".into());
