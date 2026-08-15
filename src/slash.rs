@@ -103,14 +103,7 @@ pub static COMMANDS: &[SlashCommand] = &[
     SlashCommand::plain("delete", "Delete the current session", "/delete"),
     SlashCommand::plain("new", "Start a new session", "/new"),
     SlashCommand::plain("fork", "Fork the current session", "/fork"),
-    SlashCommand::with_args(
-        "compact",
-        "Compact conversation context",
-        "/compact [instructions]",
-        "[instructions]",
-        false,
-        ArgumentSource::None,
-    ),
+    SlashCommand::plain("compact", "Compact conversation context", "/compact"),
     SlashCommand::plain("copy", "Copy the last response", "/copy"),
     SlashCommand::with_args(
         "find",
@@ -125,7 +118,6 @@ pub static COMMANDS: &[SlashCommand] = &[
     SlashCommand::plain("transcript", "View the full transcript", "/transcript"),
     SlashCommand::plain("edit-prompt", "Edit the previous prompt", "/edit-prompt"),
     SlashCommand::plain("expand", "Expand the current response", "/expand"),
-    SlashCommand::plain("context", "Show loaded project context", "/context"),
     SlashCommand::plain("model", "Open the provider and model catalog", "/model"),
     SlashCommand::with_args(
         "effort",
@@ -139,14 +131,6 @@ pub static COMMANDS: &[SlashCommand] = &[
         "always-approve",
         "Configure approval behavior",
         "/always-approve [on|off]",
-        "[on|off]",
-        false,
-        ArgumentSource::Values(TOGGLE_VALUES),
-    ),
-    SlashCommand::with_args(
-        "auto",
-        "Configure autonomous execution",
-        "/auto [on|off]",
         "[on|off]",
         false,
         ArgumentSource::Values(TOGGLE_VALUES),
@@ -211,6 +195,7 @@ pub static COMMANDS: &[SlashCommand] = &[
     SlashCommand::plain("view-plan", "View the current plan", "/view-plan"),
     SlashCommand::plain("resume", "Resume a previous session", "/resume"),
     SlashCommand::plain("mcps", "Manage MCP servers", "/mcps"),
+    SlashCommand::plain("skills", "Browse installed skills", "/skills"),
     SlashCommand::plain("workflows", "View saved workflows", "/workflows"),
     SlashCommand::with_args(
         "btw",
@@ -231,10 +216,10 @@ pub static COMMANDS: &[SlashCommand] = &[
         ArgumentSource::Values(TOGGLE_VALUES),
     ),
     SlashCommand::with_args(
-        "loop",
-        "Schedule repeated work",
-        "/loop <schedule> <prompt>",
-        "<schedule> <prompt>",
+        "jobs",
+        "Set up persistent background work",
+        "/jobs <instructions>",
+        "<instructions>",
         true,
         ArgumentSource::None,
     ),
@@ -247,22 +232,13 @@ pub static COMMANDS: &[SlashCommand] = &[
         ArgumentSource::Values(TOGGLE_VALUES),
     ),
     SlashCommand::plain("timeline", "Open session timeline", "/timeline"),
-    SlashCommand::plain("settings", "Open settings", "/settings"),
     SlashCommand::plain("privacy", "Show privacy controls", "/privacy"),
     SlashCommand::plain("rewind", "Rewind to an earlier turn", "/rewind"),
-    SlashCommand::plain("jump", "Jump to a session item", "/jump"),
-    SlashCommand::plain("login", "Sign in to Indus", "/login"),
-    SlashCommand::plain("logout", "Sign out of Indus", "/logout"),
     SlashCommand::plain("usage", "Show usage summary", "/usage"),
     SlashCommand::plain("queue", "Show queued prompts", "/queue"),
     SlashCommand::plain("tasks", "Show background tasks", "/tasks"),
     SlashCommand::plain("release-notes", "Show release notes", "/release-notes"),
     SlashCommand::plain("tutorial", "Open the interactive tutorial", "/tutorial"),
-    SlashCommand::plain(
-        "config-agents",
-        "Configure project agents",
-        "/config-agents",
-    ),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -539,7 +515,20 @@ mod tests {
 
     #[test]
     fn excluded_commands_are_not_registered() {
-        for name in ["plugins", "imagine", "imagine-video", "remember"] {
+        for name in [
+            "plugins",
+            "imagine",
+            "imagine-video",
+            "remember",
+            "login",
+            "logout",
+            "context",
+            "auto",
+            "settings",
+            "jump",
+            "config-agents",
+            "loop",
+        ] {
             assert!(COMMANDS.iter().all(|command| command.name != name));
         }
     }
