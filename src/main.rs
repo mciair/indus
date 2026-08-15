@@ -1,4 +1,5 @@
 mod app;
+mod features;
 pub mod harness;
 mod provider;
 mod slash;
@@ -7,13 +8,14 @@ mod ui;
 
 use std::{
     collections::VecDeque,
-    env,
+    env, fs,
     io::{self, Write},
+    path::PathBuf,
     process::{Command, Stdio},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use app::{App, SessionCommand};
 use crossterm::{
     event::{
@@ -134,6 +136,7 @@ fn handle_key(app: &mut App, harness: &Harness, key: KeyEvent) {
     if is_mode_cycle_key(key)
         && app.resume_panel.is_none()
         && app.catalog_modal.is_none()
+        && app.browser_panel.is_none()
         && app.permission.is_none()
     {
         app.request_next_mode();
@@ -141,6 +144,10 @@ fn handle_key(app: &mut App, harness: &Harness, key: KeyEvent) {
     }
     if app.resume_panel.is_some() {
         handle_resume_key(app, key);
+        return;
+    }
+    if app.browser_panel.is_some() {
+        handle_browser_key(app, key);
         return;
     }
     if app.catalog_modal.is_some() {
@@ -218,9 +225,13 @@ fn handle_key(app: &mut App, harness: &Harness, key: KeyEvent) {
         KeyCode::Down if app.transcript.is_empty() && app.composer.is_empty() => {
             app.selected_menu = (app.selected_menu + 1).min(app::HOME_MENU.len() - 1);
         }
+        KeyCode::Enter if app.multiline_mode && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.edit_composer(|composer| composer.insert_newline());
+        }
         KeyCode::Enter
-            if key.modifiers.contains(KeyModifiers::SHIFT)
-                || key.modifiers.contains(KeyModifiers::ALT) =>
+            if !app.multiline_mode
+                && (key.modifiers.contains(KeyModifiers::SHIFT)
+                    || key.modifiers.contains(KeyModifiers::ALT)) =>
         {
             app.edit_composer(|composer| composer.insert_newline());
         }
@@ -237,6 +248,24 @@ fn handle_key(app: &mut App, harness: &Harness, key: KeyEvent) {
         {
             app.edit_composer(|composer| composer.insert_char(ch));
         }
+        _ => {}
+    }
+}
+
+fn handle_browser_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.close_browser_level(),
+        KeyCode::Up => app.move_browser_selection(-1),
+        KeyCode::Down => app.move_browser_selection(1),
+        KeyCode::PageUp => app.move_browser_selection(-8),
+        KeyCode::PageDown => app.move_browser_selection(8),
+        KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+            app.move_browser_selection(-1)
+        }
+        KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
+            app.move_browser_selection(1)
+        }
+        KeyCode::Enter if key.modifiers.is_empty() => app.submit_browser_selection(),
         _ => {}
     }
 }
@@ -359,6 +388,25 @@ fn handle_slash_key(app: &mut App, key: KeyEvent) -> bool {
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     let x = mouse.column;
     let y = mouse.row;
+    if app.browser_panel.is_some() {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => app.move_browser_selection(-1),
+            MouseEventKind::ScrollDown => app.move_browser_selection(1),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let hit = app
+                    .hit_zones
+                    .browser_rows
+                    .iter()
+                    .find_map(|(area, index)| contains(*area, x, y).then_some(*index));
+                if let Some(index) = hit {
+                    app.select_browser_index(index);
+                    app.submit_browser_selection();
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
     if app.resume_panel.is_some() {
         match mouse.kind {
             MouseEventKind::ScrollUp => app.move_resume_selection(-1),
@@ -564,6 +612,81 @@ fn dispatch_app_commands(
                     app.report_session_error(format!("Could not delete the session: {error:#}"))
                 }
             },
+            SessionCommand::Fork => {
+                if harness.is_busy() {
+                    let parent = harness.session_snapshot();
+                    match Harness::configured_with_ephemeral_session(parent) {
+                        Ok(replacement) => {
+                            let mode = harness.mode();
+                            let _ = replacement.set_mode(mode);
+                            let previous = std::mem::replace(harness, replacement);
+                            backgrounds.push(BackgroundHarness {
+                                harness: previous,
+                                queued_prompts: app.take_queued_prompts(),
+                            });
+                            app.load_session(&harness.session_snapshot());
+                            app.report_session_error(
+                                "Opened an ephemeral fork. The parent session is continuing in the background.",
+                            );
+                        }
+                        Err(error) => app.report_session_error(format!(
+                            "Could not fork the current session: {error:#}"
+                        )),
+                    }
+                } else {
+                    match harness.fork_session() {
+                        Ok(session) => {
+                            app.load_session(&session);
+                            app.report_session_error(
+                                "Opened an ephemeral fork. Its changes will not alter the parent session history.",
+                            );
+                        }
+                        Err(error) => app.report_session_error(format!(
+                            "Could not fork the current session: {error:#}"
+                        )),
+                    }
+                }
+            }
+            SessionCommand::Rewind => match harness.rewind_session() {
+                Ok(session) => {
+                    app.load_session(&session);
+                    app.report_session_error("Rewound the latest user turn and its response.");
+                }
+                Err(error) => {
+                    app.report_session_error(format!("Could not rewind the session: {error:#}"))
+                }
+            },
+            SessionCommand::Export(markdown) => match export_transcript(app, &markdown) {
+                Ok(path) => {
+                    app.report_session_error(format!("Transcript exported to {}.", path.display()))
+                }
+                Err(error) => {
+                    app.report_session_error(format!("Could not export the transcript: {error:#}"))
+                }
+            },
+            SessionCommand::Doctor => {
+                let report = doctor_report(app, harness);
+                app.open_document("Indus doctor", report);
+            }
+            SessionCommand::Worktree => match create_worktree(&app.cwd) {
+                Ok((path, branch)) => app.report_session_error(format!(
+                    "Created worktree {} on branch {branch}.",
+                    path.display()
+                )),
+                Err(error) => {
+                    app.report_session_error(format!("Could not create a worktree: {error:#}"))
+                }
+            },
+            SessionCommand::SelectRelease(version) => {
+                let current = env!("CARGO_PKG_VERSION");
+                app.report_session_error(if version == current {
+                    format!("Indus v{version} is already installed.")
+                } else {
+                    format!(
+                        "Selected Indus v{version}. Version update and rollback execution will be enabled in a later release."
+                    )
+                });
+            }
         }
     }
     if let Some(prompt) = app.take_submission() {
@@ -585,6 +708,107 @@ fn dispatch_app_commands(
     if let Some((request_id, reply)) = app.take_permission_reply() {
         harness.reply_permission(request_id, reply);
     }
+}
+
+fn export_transcript(app: &App, markdown: &str) -> Result<PathBuf> {
+    let timestamp = unix_millis();
+    let path = app.cwd.join(format!("indus-transcript-{timestamp}.md"));
+    fs::write(&path, markdown).with_context(|| format!("Could not write {}", path.display()))?;
+    Ok(path)
+}
+
+fn doctor_report(app: &App, harness: &Harness) -> String {
+    let session = harness.session_snapshot();
+    let model = app.active_model().map_or_else(
+        || "Not selected".to_string(),
+        |selection| {
+            format!(
+                "{} through {}",
+                selection.model_name,
+                selection.provider.name()
+            )
+        },
+    );
+    let git = Command::new("git")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_else(|| "Unavailable".to_string());
+    let repository = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&app.cwd)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_else(|| "Not inside a Git repository".to_string());
+    [
+        format!("Indus v{}", env!("CARGO_PKG_VERSION")),
+        String::new(),
+        format!("Platform: {} {}", env::consts::OS, env::consts::ARCH),
+        format!("Working directory: {}", app.cwd.display()),
+        format!("Repository: {repository}"),
+        format!("Git: {git}"),
+        format!("Model: {model}"),
+        format!(
+            "Session: {}",
+            session
+                .is_allocated()
+                .then_some(session.id.as_str())
+                .unwrap_or("Not allocated yet")
+        ),
+        format!("Mode: {}", harness.mode().label()),
+        format!("Context tokens: {}", session.current_context_tokens()),
+        "Privacy: Indus data collection is disabled".to_string(),
+    ]
+    .join("\n")
+}
+
+fn create_worktree(cwd: &std::path::Path) -> Result<(PathBuf, String)> {
+    let root_output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .context("Could not inspect the Git repository")?;
+    if !root_output.status.success() {
+        return Err(anyhow!(
+            "New Worktree requires a Git repository: {}",
+            String::from_utf8_lossy(&root_output.stderr).trim()
+        ));
+    }
+    let root = PathBuf::from(String::from_utf8_lossy(&root_output.stdout).trim());
+    let parent = root
+        .parent()
+        .ok_or_else(|| anyhow!("The repository has no parent directory"))?;
+    let repository = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("indus");
+    let timestamp = unix_millis();
+    let branch = format!("indus/worktree-{timestamp}");
+    let path = parent.join(format!("{repository}-worktree-{timestamp}"));
+    let output = Command::new("git")
+        .args(["worktree", "add", "-b", &branch])
+        .arg(&path)
+        .current_dir(&root)
+        .output()
+        .context("Could not run git worktree add")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok((path, branch))
+}
+
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn parse_resume_argument() -> Result<Option<String>> {
