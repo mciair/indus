@@ -199,6 +199,15 @@ impl Harness {
         })
     }
 
+    pub fn configured_with_ephemeral_session(session: Session) -> Result<Self, TransportError> {
+        let harness = Self::configured()?;
+        *harness
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = session.ephemeral_fork();
+        Ok(harness)
+    }
+
     pub fn list_sessions(&self, query: Option<&str>) -> anyhow::Result<Vec<SessionSummary>> {
         self.session_store
             .as_ref()
@@ -358,6 +367,35 @@ impl Harness {
             store.save(&session)?;
         }
         Ok((session.clone(), prompt))
+    }
+
+    pub fn rewind_session(&self) -> anyhow::Result<Session> {
+        if self.is_busy() {
+            return Err(anyhow::anyhow!(HarnessError::Busy));
+        }
+        let mut session = self
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        session
+            .rewind_last_turn()
+            .ok_or_else(|| anyhow::anyhow!("There is no previous turn to rewind"))?;
+        if let Some(store) = &self.session_store {
+            store.save(&session)?;
+        }
+        Ok(session.clone())
+    }
+
+    pub fn fork_session(&self) -> anyhow::Result<Session> {
+        if self.is_busy() {
+            return Err(anyhow::anyhow!(HarnessError::Busy));
+        }
+        let fork = self.session_snapshot().ephemeral_fork();
+        *self
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = fork.clone();
+        Ok(fork)
     }
 
     pub fn provider_neutral() -> Self {
@@ -1475,6 +1513,26 @@ mod tests {
         for tool in ["edit", "write", "apply_patch", "shell", "job", "repo_clone"] {
             assert!(!plan_tool_allowed(tool));
         }
+    }
+
+    #[test]
+    fn harness_forks_sessions_ephemerally_and_rewinds_the_latest_turn() {
+        let harness = Harness::provider_neutral();
+        {
+            let mut session = harness
+                .session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            session.push_user("first");
+            session.push_user("second");
+        }
+
+        let rewound = harness.rewind_session().unwrap();
+        assert_eq!(rewound.messages.len(), 1);
+
+        let fork = harness.fork_session().unwrap();
+        assert!(fork.ephemeral);
+        assert_eq!(fork.messages, rewound.messages);
     }
 
     #[test]
