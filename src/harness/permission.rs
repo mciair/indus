@@ -52,6 +52,7 @@ struct PermissionState {
     approved: Vec<PermissionRule>,
     pending: HashMap<u64, Option<PermissionReply>>,
     next_request_id: u64,
+    always_approve: bool,
 }
 
 #[derive(Clone, Default)]
@@ -82,6 +83,22 @@ impl PermissionService {
         )
     }
 
+    pub fn set_always_approve(&self, enabled: bool) {
+        let (state, _) = &*self.shared;
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .always_approve = enabled;
+    }
+
+    pub fn is_always_approve(&self) -> bool {
+        let (state, _) = &*self.shared;
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .always_approve
+    }
+
     pub fn authorize(
         &self,
         run_id: u64,
@@ -91,11 +108,13 @@ impl PermissionService {
         cancellation: &CancellationToken,
         emit: &dyn Fn(HarnessEvent),
     ) -> Result<(), PermissionError> {
+        let always_approve = self.is_always_approve();
         let mut needs_approval = false;
         for pattern in patterns {
             match self.evaluate(permission, pattern) {
                 PermissionAction::Allow => {}
-                PermissionAction::Ask => needs_approval = true,
+                PermissionAction::Ask if !always_approve => needs_approval = true,
+                PermissionAction::Ask => {}
                 PermissionAction::Deny => return Err(PermissionError::Denied),
             }
         }
@@ -221,6 +240,8 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     #[test]
@@ -249,5 +270,50 @@ mod tests {
         assert!(wildcard_match("src/*.rs", "src/harness/model.rs"));
         assert!(wildcard_match("file-?.txt", "file-a.txt"));
         assert!(!wildcard_match("file-?.txt", "file-long.txt"));
+    }
+
+    #[test]
+    fn always_approve_bypasses_ask_rules_without_emitting_a_prompt() {
+        let service = PermissionService::new(vec![PermissionRule {
+            permission: "shell".into(),
+            pattern: "*".into(),
+            action: PermissionAction::Ask,
+        }]);
+        service.set_always_approve(true);
+        let emitted = Cell::new(false);
+
+        let result = service.authorize(
+            1,
+            "shell",
+            &["git status".into()],
+            "Check status",
+            &CancellationToken::default(),
+            &|_| emitted.set(true),
+        );
+
+        assert_eq!(result, Ok(()));
+        assert!(!emitted.get());
+    }
+
+    #[test]
+    fn always_approve_does_not_override_an_explicit_denial() {
+        let service = PermissionService::new(vec![PermissionRule {
+            permission: "shell".into(),
+            pattern: "dangerous".into(),
+            action: PermissionAction::Deny,
+        }]);
+        service.set_always_approve(true);
+
+        assert_eq!(
+            service.authorize(
+                1,
+                "shell",
+                &["dangerous".into()],
+                "Denied command",
+                &CancellationToken::default(),
+                &|_| {},
+            ),
+            Err(PermissionError::Denied)
+        );
     }
 }
