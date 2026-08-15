@@ -13,9 +13,25 @@ use chrono_tz::Tz;
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
 
-use super::classifier::{Classification, JobSchedule};
-
 const STORE_VERSION: u8 = 1;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum JobSchedule {
+    Interval {
+        interval_ms: u64,
+    },
+    ClockBased {
+        clock_times: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        time_zone: Option<String>,
+    },
+    Cron {
+        cron_expr: String,
+    },
+    #[serde(rename = "24_7")]
+    Continuous,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,7 +57,6 @@ pub struct Job {
     pub run_count: u64,
     pub last_result: Option<String>,
     pub last_error: Option<String>,
-    pub classifier_decision: Classification,
 }
 
 impl Job {
@@ -111,15 +126,20 @@ impl JobService {
         }
     }
 
-    pub fn create(&self, goal: impl Into<String>, decision: Classification) -> io::Result<Job> {
+    pub fn create(
+        &self,
+        goal: impl Into<String>,
+        name: impl Into<String>,
+        schedule: JobSchedule,
+    ) -> io::Result<Job> {
         let goal = goal.into();
-        let schedule = decision.schedule.clone().unwrap_or(JobSchedule::Continuous);
+        let name = name.into();
         let now = now_ms();
         let mut state = self.lock();
         state.sequence = state.sequence.saturating_add(1);
         let job = Job {
             id: format!("job-{now}-{}", state.sequence),
-            name: decision.short_description.clone(),
+            name,
             goal,
             schedule: schedule.clone(),
             status: JobStatus::Active,
@@ -131,7 +151,6 @@ impl JobService {
             run_count: 0,
             last_result: None,
             last_error: None,
-            classifier_decision: decision,
         };
         state.stored.jobs.push(job.clone());
         persist(&state)?;
@@ -428,21 +447,6 @@ fn secure_file(_path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::classifier::GoalCategory;
-
-    fn decision(schedule: JobSchedule) -> Classification {
-        Classification {
-            category: GoalCategory::TimeBasedJob,
-            estimated_tool_calls: 5,
-            estimated_minutes: 10.0,
-            has_clear_endpoint: false,
-            is_recurring: true,
-            confidence: 0.9,
-            routing_reason: "recurring request".into(),
-            short_description: "Monitor deployment health".into(),
-            schedule: Some(schedule),
-        }
-    }
 
     #[test]
     fn jobs_persist_across_service_instances() {
@@ -452,9 +456,10 @@ mod tests {
         let created = first
             .create(
                 "monitor deployment",
-                decision(JobSchedule::Interval {
+                "Monitor deployment health",
+                JobSchedule::Interval {
                     interval_ms: 60_000,
-                }),
+                },
             )
             .unwrap();
         let second = JobService::at(path);
@@ -468,7 +473,8 @@ mod tests {
         let job = service
             .create(
                 "monitor deployment",
-                decision(JobSchedule::Interval { interval_ms: 5_000 }),
+                "Monitor deployment health",
+                JobSchedule::Interval { interval_ms: 5_000 },
             )
             .unwrap();
         service.mark_started(&job.id, 10_000).unwrap();
