@@ -34,10 +34,11 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     let prompt_width = area.width.saturating_sub(4).max(4);
     let prompt_height = composer_height(app.composer.text(), prompt_width.saturating_sub(8));
+    let turn_status_visible = app.turn.as_ref().is_some_and(|turn| turn.status_visible);
     let turn_height = if app.permission.is_some() {
         3
     } else {
-        u16::from(app.turn.is_some())
+        u16::from(turn_status_visible)
     };
     let prompt_gap = u16::from(turn_height == 0 && area.height > 16);
     let [top, body, banner, turn, prompt] = Layout::vertical([
@@ -73,7 +74,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         render_transcript(frame, content, app, &theme, &mut zones);
     }
-    if app.turn.is_some() {
+    if turn_status_visible {
         render_turn_status(frame, turn, app, &theme);
     } else if let Some((message, opacity)) = app.mode_banner() {
         render_mode_banner(frame, banner, message, opacity, &theme);
