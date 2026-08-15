@@ -350,7 +350,7 @@ pub enum SessionCommand {
     EditPrompt,
     Copy(String),
     Rename(String),
-    Compact(Option<String>),
+    Compact,
     SetMode(SessionMode),
     SessionInfo,
     Delete,
@@ -1641,9 +1641,7 @@ impl App {
             }
             "compact" => {
                 self.turn = Some(ActiveTurn::new());
-                self.pending_session_command = Some(SessionCommand::Compact(
-                    (!args.is_empty()).then(|| args.to_string()),
-                ));
+                self.pending_session_command = Some(SessionCommand::Compact);
             }
             "plan" => {
                 let mode = if self.session_mode == SessionMode::Plan {
@@ -1938,16 +1936,13 @@ mod tests {
     }
 
     #[test]
-    fn compact_command_preserves_optional_user_guidance() {
+    fn compact_command_starts_system_compaction_without_arguments() {
         let mut app = App::new();
-        app.composer.set("/compact retain exact paths");
+        app.composer.set("/compact");
         app.submit();
 
         assert!(app.turn.is_some());
-        assert_eq!(
-            app.take_session_command(),
-            Some(SessionCommand::Compact(Some("retain exact paths".into())))
-        );
+        assert_eq!(app.take_session_command(), Some(SessionCommand::Compact));
     }
 
     #[test]
