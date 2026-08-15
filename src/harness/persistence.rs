@@ -189,6 +189,17 @@ impl SessionStore {
             .context("Could not commit the Indus session")
     }
 
+    pub fn delete(&self, id: &str) -> Result<bool> {
+        if !id.starts_with("ses-i_") {
+            return Ok(false);
+        }
+        let connection = self.connect()?;
+        let deleted = connection
+            .execute("DELETE FROM session WHERE id = ?1", params![id])
+            .context("Could not delete the Indus session")?;
+        Ok(deleted > 0)
+    }
+
     fn initialize(&self) -> Result<()> {
         let connection = self.connect()?;
         connection
@@ -325,6 +336,20 @@ mod tests {
         let summaries = store.list(Some("Remember")).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].first_prompt, "remember this");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deleting_a_session_removes_its_messages() {
+        let (root, store) = temporary_store();
+        let mut session = Session::unallocated("/workspace");
+        session.push_user("delete this");
+        assert!(session.allocate("ses-i_delete", "Delete Me", None, None));
+        store.save(&session).unwrap();
+
+        assert!(store.delete("ses-i_delete").unwrap());
+        assert_eq!(store.load("ses-i_delete").unwrap(), None);
+        assert!(store.list(None).unwrap().is_empty());
         let _ = fs::remove_dir_all(root);
     }
 }
