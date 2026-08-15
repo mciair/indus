@@ -4,7 +4,6 @@
 //! authentication remain outside this module and connect through `ModelTransport`.
 
 mod builtin_tools;
-mod classifier;
 pub mod event;
 pub mod jobs;
 pub mod model;
@@ -28,7 +27,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use classifier::GoalCategory;
 use event::{HarnessEvent, PermissionReply, RunOutcome};
 use jobs::{Job, JobService, now_ms};
 use model::{
@@ -39,7 +37,7 @@ use permission::{PermissionAction, PermissionError, PermissionRule, PermissionSe
 use persistence::SessionStore;
 pub use persistence::SessionSummary;
 use processor::{ProcessOutcome, StreamProcessor};
-use session::{AssistantMessage, AssistantPart, Session, TextPart};
+use session::{AssistantPart, CompactionInput, Session};
 use tool::{ToolContext, ToolRegistry};
 use transport::ProviderTransport;
 
@@ -49,6 +47,34 @@ const DEFAULT_RETRY_DELAY_MS: u64 = 2_000;
 const MAX_RETRY_DELAY_MS: u64 = 30_000;
 const DOOM_LOOP_THRESHOLD: usize = 3;
 const DEFAULT_COMPACTION_THRESHOLD_PERCENT: u8 = 85;
+const COMPACTION_SOURCE_LIMIT: usize = 90_000;
+const COMPACTION_PRESERVED_USER_TURNS: usize = 2;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SessionMode {
+    #[default]
+    Normal,
+    Plan,
+    AlwaysApprove,
+}
+
+impl SessionMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Plan => "Plan",
+            Self::AlwaysApprove => "Always-Approve",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Normal => Self::Plan,
+            Self::Plan => Self::AlwaysApprove,
+            Self::AlwaysApprove => Self::Normal,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct HarnessConfig {
@@ -56,7 +82,6 @@ pub struct HarnessConfig {
     pub max_steps: usize,
     pub max_retries: u16,
     pub compaction_threshold_percent: u8,
-    pub classify_prompts: bool,
 }
 
 impl Default for HarnessConfig {
@@ -66,7 +91,6 @@ impl Default for HarnessConfig {
             max_steps: DEFAULT_MAX_STEPS,
             max_retries: DEFAULT_MAX_RETRIES,
             compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
-            classify_prompts: false,
         }
     }
 }
@@ -101,6 +125,7 @@ pub struct Harness {
     cancellation: Arc<Mutex<Option<CancellationToken>>>,
     jobs: JobService,
     session_store: Option<SessionStore>,
+    mode: Arc<Mutex<SessionMode>>,
 }
 
 impl Harness {
@@ -124,6 +149,7 @@ impl Harness {
             cancellation: Arc::new(Mutex::new(None)),
             jobs: JobService::load(),
             session_store: None,
+            mode: Arc::new(Mutex::new(SessionMode::Normal)),
         }
     }
 
@@ -159,7 +185,6 @@ impl Harness {
             permissions,
             config: HarnessConfig {
                 system: vec![default_system_prompt()],
-                classify_prompts: true,
                 ..HarnessConfig::default()
             },
             session: Arc::new(Mutex::new(session)),
@@ -170,6 +195,7 @@ impl Harness {
             cancellation: Arc::new(Mutex::new(None)),
             jobs,
             session_store: Some(session_store),
+            mode: Arc::new(Mutex::new(SessionMode::Normal)),
         })
     }
 
@@ -241,6 +267,82 @@ impl Harness {
         Ok(title.to_string())
     }
 
+    pub fn session_info(&self) -> String {
+        let session = self.session_snapshot();
+        let id = if session.is_allocated() {
+            session.id.as_str()
+        } else {
+            "Not allocated yet"
+        };
+        let title = session.title.as_deref().unwrap_or("Untitled");
+        let provider = session.provider_id.as_deref().unwrap_or("Not recorded");
+        let model = session.model_id.as_deref().unwrap_or("Not recorded");
+        let context = session.current_context_tokens();
+        let window = self
+            .transport
+            .context_window()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "Unknown".to_string());
+        [
+            "| Session | Value |".to_string(),
+            "| --- | --- |".to_string(),
+            format!("| ID | {id} |"),
+            format!("| Title | {title} |"),
+            format!("| Mode | {} |", self.mode().label()),
+            format!("| Provider | {provider} |"),
+            format!("| Model | {model} |"),
+            format!("| Messages | {} |", session.messages.len()),
+            format!("| Context | {context} / {window} tokens |"),
+            format!("| Directory | {} |", session.directory),
+        ]
+        .join("\n")
+    }
+
+    pub fn delete_session(&self) -> anyhow::Result<(Session, String)> {
+        if self.is_busy() {
+            return Err(anyhow::anyhow!(HarnessError::Busy));
+        }
+        let current = self.session_snapshot();
+        if !current.is_allocated() {
+            return Err(anyhow::anyhow!(
+                "This conversation has no saved session to delete"
+            ));
+        }
+        let store = self
+            .session_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Session history is unavailable"))?;
+        if !store.delete(&current.id)? {
+            return Err(anyhow::anyhow!("Session not found: {}", current.id));
+        }
+        let session = Session::unallocated(current.directory);
+        *self
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = session.clone();
+        Ok((session, current.id))
+    }
+
+    pub fn set_mode(&self, mode: SessionMode) -> anyhow::Result<()> {
+        if self.is_busy() {
+            return Err(anyhow::anyhow!(HarnessError::Busy));
+        }
+        self.permissions
+            .set_always_approve(mode == SessionMode::AlwaysApprove);
+        *self
+            .mode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = mode;
+        Ok(())
+    }
+
+    pub fn mode(&self) -> SessionMode {
+        *self
+            .mode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn edit_previous_prompt(&self) -> anyhow::Result<(Session, String)> {
         if self.is_busy() {
             return Err(anyhow::anyhow!(HarnessError::Busy));
@@ -306,8 +408,8 @@ impl Harness {
             session: Arc::clone(&self.session),
             events: self.event_tx.clone(),
             cancellation: cancellation.clone(),
-            jobs: self.jobs.clone(),
             session_store: self.session_store.clone(),
+            mode: self.mode(),
         };
         let busy = Arc::clone(&self.busy);
         let active_cancellation = Arc::clone(&self.cancellation);
@@ -330,6 +432,67 @@ impl Harness {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             *active = None;
+        });
+        Ok(run_id)
+    }
+
+    pub fn compact_context(&self, instructions: Option<String>) -> anyhow::Result<u64> {
+        {
+            let session = self
+                .session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if session
+                .compaction_input(COMPACTION_PRESERVED_USER_TURNS, COMPACTION_SOURCE_LIMIT)
+                .is_none()
+            {
+                return Err(anyhow::anyhow!(
+                    "There is no conversation context to compact"
+                ));
+            }
+        }
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(anyhow::anyhow!(HarnessError::Busy));
+        }
+
+        let run_id = self.next_run_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let cancellation = CancellationToken::default();
+        *self
+            .cancellation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cancellation.clone());
+        let runtime = Runtime {
+            transport: Arc::clone(&self.transport),
+            tools: self.tools.clone(),
+            permissions: self.permissions.clone(),
+            config: self.config.clone(),
+            session: Arc::clone(&self.session),
+            events: self.event_tx.clone(),
+            cancellation,
+            session_store: self.session_store.clone(),
+            mode: self.mode(),
+        };
+        let busy = Arc::clone(&self.busy);
+        let active_cancellation = Arc::clone(&self.cancellation);
+        thread::spawn(move || {
+            runtime.emit(HarnessEvent::RunStarted { run_id });
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                if runtime.compact(run_id, instructions.as_deref()) {
+                    RunOutcome::Compacted
+                } else {
+                    RunOutcome::CompactionRequired
+                }
+            }))
+            .unwrap_or(RunOutcome::Failed);
+            runtime.finish(run_id, outcome);
+            busy.store(false, Ordering::Release);
+            *active_cancellation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         });
         Ok(run_id)
     }
@@ -411,15 +574,12 @@ impl Harness {
             transport: Arc::clone(&self.transport),
             tools: self.tools.clone(),
             permissions: self.permissions.clone(),
-            config: HarnessConfig {
-                classify_prompts: false,
-                ..self.config.clone()
-            },
+            config: self.config.clone(),
             session: Arc::clone(&session),
             events: self.event_tx.clone(),
             cancellation,
-            jobs: self.jobs.clone(),
             session_store: None,
+            mode: self.mode(),
         };
         let events = self.event_tx.clone();
         let busy = Arc::clone(&self.busy);
@@ -474,33 +634,13 @@ struct Runtime {
     session: Arc<Mutex<Session>>,
     events: Sender<HarnessEvent>,
     cancellation: CancellationToken,
-    jobs: JobService,
     session_store: Option<SessionStore>,
+    mode: SessionMode,
 }
 
 impl Runtime {
-    fn run(&self, run_id: u64, parent_id: u64, classify_goal: Option<&str>) -> RunOutcome {
+    fn run(&self, run_id: u64, parent_id: u64, user_prompt: Option<&str>) -> RunOutcome {
         self.emit(HarnessEvent::RunStarted { run_id });
-
-        if self.config.classify_prompts
-            && let Some(goal) = classify_goal
-        {
-            self.emit(HarnessEvent::ClassifierStarted { run_id });
-            let decision = classifier::classify(self.transport.as_ref(), goal, &self.cancellation)
-                .unwrap_or_else(|_| {
-                    classifier::Classification::fallback(
-                        "Classifier failed; Indus will handle the request directly.",
-                    )
-                });
-            self.emit(HarnessEvent::ClassifierFinished {
-                run_id,
-                category: format!("{:?}", decision.category),
-                description: decision.short_description.clone(),
-            });
-            if decision.category == GoalCategory::TimeBasedJob {
-                return self.schedule_job(run_id, parent_id, goal, decision);
-            }
-        }
 
         'steps: for step in 1..=self.config.max_steps.max(1) {
             if self.cancellation.is_cancelled() {
@@ -514,10 +654,20 @@ impl Runtime {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 (session.next_assistant(parent_id), session.model_messages())
             };
+            let mut system = self.config.system.clone();
+            if self.mode == SessionMode::Plan {
+                system.push(plan_mode_prompt());
+            }
+            let tools = self
+                .tools
+                .definitions()
+                .into_iter()
+                .filter(|tool| self.mode != SessionMode::Plan || plan_tool_allowed(&tool.name))
+                .collect();
             let request = ModelRequest {
-                system: self.config.system.clone(),
+                system,
                 messages,
-                tools: self.tools.definitions(),
+                tools,
                 step,
             };
             let mut processor = StreamProcessor::new(run_id, assistant);
@@ -534,7 +684,7 @@ impl Runtime {
                     TransportErrorKind::ContextOverflow => {
                         let (message, _) = processor.finish(&|event| self.emit(event));
                         self.push_assistant(message);
-                        if self.compact(run_id) {
+                        if self.compact(run_id, None) {
                             continue 'steps;
                         }
                         self.emit(HarnessEvent::CompactionRequired { run_id });
@@ -596,12 +746,12 @@ impl Runtime {
             if blocked {
                 return self.finish(run_id, RunOutcome::Failed);
             }
-            if self.should_compact() && !self.compact(run_id) {
+            if self.should_compact() && !self.compact(run_id, None) {
                 self.emit(HarnessEvent::CompactionRequired { run_id });
                 return self.finish(run_id, RunOutcome::CompactionRequired);
             }
             if outcome == ProcessOutcome::Stop {
-                if let Some(goal) = classify_goal {
+                if let Some(goal) = user_prompt {
                     self.ensure_session_identity(run_id, goal);
                 }
                 return self.finish(run_id, RunOutcome::Completed);
@@ -613,64 +763,6 @@ impl Runtime {
             message: "The harness reached its configured step limit.".to_string(),
         });
         self.finish(run_id, RunOutcome::StepLimitReached)
-    }
-
-    fn schedule_job(
-        &self,
-        run_id: u64,
-        parent_id: u64,
-        goal: &str,
-        decision: classifier::Classification,
-    ) -> RunOutcome {
-        let job = match self.jobs.create(goal, decision) {
-            Ok(job) => job,
-            Err(error) => {
-                self.emit(HarnessEvent::RunError {
-                    run_id,
-                    message: format!("Could not persist the Job: {error}"),
-                });
-                return self.finish(run_id, RunOutcome::Failed);
-            }
-        };
-        let schedule = job.schedule_description();
-        self.emit(HarnessEvent::JobScheduled {
-            run_id,
-            job_id: job.id.clone(),
-            name: job.name.clone(),
-            schedule: schedule.clone(),
-        });
-        let text = format!("Scheduled {} {}.", job.name, schedule);
-        let text_id = format!("job-{}", job.id);
-        self.emit(HarnessEvent::TextStarted {
-            run_id,
-            text_id: text_id.clone(),
-        });
-        self.emit(HarnessEvent::TextDelta {
-            run_id,
-            text_id: text_id.clone(),
-            text: text.clone(),
-        });
-        self.emit(HarnessEvent::TextFinished {
-            run_id,
-            text_id: text_id.clone(),
-        });
-        let mut assistant = AssistantMessage::new(
-            self.session
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .next_assistant(parent_id)
-                .id,
-            parent_id,
-        );
-        assistant.parts.push(AssistantPart::Text(TextPart {
-            id: text_id,
-            text,
-            completed: true,
-        }));
-        assistant.finish = Some(model::StopReason::Stop);
-        self.push_assistant(assistant);
-        self.ensure_session_identity(run_id, goal);
-        self.finish(run_id, RunOutcome::Scheduled)
     }
 
     fn stream_with_retry(
@@ -720,6 +812,17 @@ impl Runtime {
         call: &processor::PendingToolCall,
         processor: &mut StreamProcessor,
     ) -> bool {
+        if self.mode == SessionMode::Plan && !plan_tool_allowed(&call.name) {
+            let message = format!("{} is unavailable in Plan mode", call.name);
+            processor.fail_tool(&call.call_id, &message);
+            self.emit(HarnessEvent::ToolFailed {
+                run_id,
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+                message,
+            });
+            return true;
+        }
         let Some(tool) = self.tools.get(&call.name) else {
             let message = format!("Tool not found: {}", call.name);
             processor.fail_tool(&call.call_id, &message);
@@ -804,26 +907,28 @@ impl Runtime {
         }
     }
 
-    fn compact(&self, run_id: u64) -> bool {
-        let source = {
+    fn compact(&self, run_id: u64, instructions: Option<&str>) -> bool {
+        let input = {
             let session = self
                 .session
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if session.messages.len() < 4 {
+            let Some(input) =
+                session.compaction_input(COMPACTION_PRESERVED_USER_TURNS, COMPACTION_SOURCE_LIMIT)
+            else {
                 return false;
-            }
-            session.summary_source(90_000)
+            };
+            input
         };
         self.emit(HarnessEvent::CompactionStarted { run_id });
         let request = ModelRequest {
-            system: vec![
-                "Summarize this coding session for continuation after context compaction. Preserve the user's goals and constraints, decisions, files inspected or changed, commands and test outcomes, unresolved errors, active Jobs, and exact next steps. Do not include hidden reasoning. Return only the continuation summary."
-                    .to_string(),
-            ],
+            system: vec![compaction_system_prompt()],
             messages: vec![ModelMessage {
                 role: Role::User,
-                content: vec![ModelContent::Text(source)],
+                content: vec![ModelContent::Text(compaction_user_prompt(
+                    &input,
+                    instructions,
+                ))],
             }],
             tools: Vec::new(),
             step: 0,
@@ -846,7 +951,7 @@ impl Runtime {
             .session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        session.compact(summary, 4);
+        session.compact_at(summary, input.preserve_from);
         if let Some(store) = &self.session_store {
             let _ = store.save(&session);
         }
@@ -1018,6 +1123,77 @@ fn context_compaction_threshold(context_window: Option<u64>, percent: u8) -> Opt
     }
     let threshold = (u128::from(context_window) * u128::from(percent)).div_ceil(100);
     Some(threshold.min(u128::from(u64::MAX)) as u64)
+}
+
+fn plan_mode_prompt() -> String {
+    [
+        "PLAN MODE is active.",
+        "Inspect the project using read-only tools and produce a concrete implementation plan.",
+        "Do not edit files, run mutating commands, clone repositories, or create or modify Jobs.",
+        "Ask only questions that materially block a reliable plan, and do not claim changes were made.",
+    ]
+    .join("\n")
+}
+
+fn plan_tool_allowed(name: &str) -> bool {
+    matches!(
+        name,
+        "read" | "glob" | "grep" | "web_fetch" | "web_search" | "repo_overview"
+    )
+}
+
+fn compaction_system_prompt() -> String {
+    [
+        "You are an anchored context summarization assistant for coding sessions.",
+        "Summarize only the conversation history you are given. The newest turns are kept verbatim outside your summary, so focus on the older context that still matters for continuing the work.",
+        "If the prompt includes a <previous-summary> block, treat it as the current anchored summary. Update it with the new history by preserving still-true details, removing stale details, and merging in new facts.",
+        "Always follow the exact output structure requested by the user prompt. Keep every section, preserve exact file paths and identifiers when known, and prefer terse bullets over paragraphs.",
+        "Do not answer the conversation itself. Do not mention that you are summarizing, compacting, or merging context. Do not include hidden reasoning. Respond in the same language as the conversation.",
+    ]
+    .join("\n")
+}
+
+fn compaction_user_prompt(input: &CompactionInput, instructions: Option<&str>) -> String {
+    let mut prompt = String::new();
+    if let Some(previous) = input.previous_summary.as_deref() {
+        prompt.push_str("<previous-summary>\n");
+        prompt.push_str(previous);
+        prompt.push_str("\n</previous-summary>\n\n");
+    }
+    prompt.push_str("<conversation-history>\n");
+    prompt.push_str(&input.history);
+    prompt.push_str("</conversation-history>\n\n");
+    if let Some(instructions) = instructions
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        prompt.push_str("Additional user guidance:\n");
+        prompt.push_str(instructions);
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str(
+        "Return exactly this structure. Keep every section and use terse bullets.\n\n\
+## Goal\n\
+- [single-sentence task summary]\n\n\
+## Constraints & Preferences\n\
+- [...]\n\n\
+## Progress\n\
+### Done\n\
+- [...]\n\
+### In Progress\n\
+- [...]\n\
+### Blocked\n\
+- [...]\n\n\
+## Key Decisions\n\
+- [...]\n\n\
+## Next Steps\n\
+- [...]\n\n\
+## Critical Context\n\
+- [...]\n\n\
+## Relevant Files\n\
+- [...]",
+    );
+    prompt
 }
 
 fn default_permission_rules() -> Vec<PermissionRule> {
@@ -1358,6 +1534,92 @@ mod tests {
         );
         assert_eq!(context_compaction_threshold(None, 85), None);
         assert_eq!(context_compaction_threshold(Some(200_000), 0), None);
+    }
+
+    #[test]
+    fn plan_mode_only_exposes_read_only_discovery_tools() {
+        for tool in [
+            "read",
+            "glob",
+            "grep",
+            "web_fetch",
+            "web_search",
+            "repo_overview",
+        ] {
+            assert!(plan_tool_allowed(tool));
+        }
+        for tool in ["edit", "write", "apply_patch", "shell", "job", "repo_clone"] {
+            assert!(!plan_tool_allowed(tool));
+        }
+    }
+
+    #[test]
+    fn compaction_prompt_preserves_the_mirror_continuation_structure() {
+        let input = CompactionInput {
+            previous_summary: Some("## Goal\n- Existing goal".into()),
+            history: "User:\nContinue the work\n".into(),
+            preserve_from: 2,
+        };
+        let prompt = compaction_user_prompt(&input, Some("retain exact paths"));
+
+        assert!(prompt.contains("<previous-summary>"));
+        assert!(prompt.contains("retain exact paths"));
+        for heading in [
+            "## Goal",
+            "## Constraints & Preferences",
+            "## Progress",
+            "## Key Decisions",
+            "## Next Steps",
+            "## Critical Context",
+            "## Relevant Files",
+        ] {
+            assert!(prompt.contains(heading));
+        }
+    }
+
+    #[test]
+    fn manual_compaction_uses_the_model_and_replaces_old_context() {
+        let harness = Harness::new(
+            Arc::new(TextTransport),
+            ToolRegistry::default(),
+            PermissionService::default(),
+            HarnessConfig::default(),
+        );
+        harness
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_user("large conversation context");
+        harness.compact_context(None).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut events = Vec::new();
+        while Instant::now() < deadline {
+            events.extend(harness.drain_events());
+            if events.iter().any(|event| {
+                matches!(
+                    event,
+                    HarnessEvent::RunFinished {
+                        outcome: RunOutcome::Compacted,
+                        ..
+                    }
+                )
+            }) {
+                break;
+            }
+            thread::yield_now();
+        }
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, HarnessEvent::CompactionFinished { .. }))
+        );
+        assert!(matches!(
+            &harness.session_snapshot().messages[0],
+            session::SessionMessage::User(message)
+                if message.text.contains("Hello from Indus")
+        ));
     }
 
     #[test]
