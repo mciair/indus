@@ -1236,6 +1236,13 @@ impl App {
                 self.session_id = Some(session_id);
                 self.session_title = Some(title);
             }
+            HarnessEvent::SessionTitleUpdated {
+                session_id, title, ..
+            } => {
+                if self.session_id.as_deref() == Some(session_id.as_str()) {
+                    self.session_title = Some(title);
+                }
+            }
             HarnessEvent::RunStarted { run_id } => {
                 if let Some(turn) = self.turn.as_mut() {
                     turn.run_id = Some(run_id);
@@ -2020,6 +2027,27 @@ mod tests {
         assert!(app.turn.as_ref().is_some_and(|turn| {
             turn.status_visible && turn.activity == TurnActivity::Compacting
         }));
+    }
+
+    #[test]
+    fn asynchronous_titles_only_update_the_matching_active_session() {
+        let mut app = App::new();
+        app.session_id = Some("ses-i_current".into());
+        app.session_title = Some("Current Session".into());
+
+        app.apply_harness_event(HarnessEvent::SessionTitleUpdated {
+            run_id: 1,
+            session_id: "ses-i_previous".into(),
+            title: "Stale Generated Title".into(),
+        });
+        assert_eq!(app.session_title.as_deref(), Some("Current Session"));
+
+        app.apply_harness_event(HarnessEvent::SessionTitleUpdated {
+            run_id: 1,
+            session_id: "ses-i_current".into(),
+            title: "Fresh Generated Title".into(),
+        });
+        assert_eq!(app.session_title.as_deref(), Some("Fresh Generated Title"));
     }
 
     #[test]
