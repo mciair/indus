@@ -48,6 +48,11 @@ pub enum HarnessEvent {
         session_id: String,
         title: String,
     },
+    SessionTitleUpdated {
+        run_id: u64,
+        session_id: String,
+        title: String,
+    },
     RunStarted {
         run_id: u64,
     },
