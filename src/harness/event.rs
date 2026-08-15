@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunOutcome {
     Completed,
+    Compacted,
     Scheduled,
     Cancelled,
     Failed,
@@ -49,14 +50,6 @@ pub enum HarnessEvent {
     },
     RunStarted {
         run_id: u64,
-    },
-    ClassifierStarted {
-        run_id: u64,
-    },
-    ClassifierFinished {
-        run_id: u64,
-        category: String,
-        description: String,
     },
     JobScheduled {
         run_id: u64,
