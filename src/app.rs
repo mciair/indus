@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use ratatui::layout::Rect;
@@ -10,7 +10,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     harness::{
-        SessionSummary,
+        SessionMode, SessionSummary,
         event::{FileDiff, HarnessEvent, PermissionReply, RunOutcome},
         session::{AssistantPart, Session, SessionMessage, ToolState},
     },
@@ -223,7 +223,6 @@ pub enum ToolVisualState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TurnActivity {
-    Classifying,
     Compacting,
     WaitingForResponse,
     Thinking,
@@ -238,7 +237,6 @@ pub enum TurnActivity {
 impl TurnActivity {
     pub fn label(&self) -> String {
         match self {
-            Self::Classifying => "Classifying…".to_string(),
             Self::Compacting => "Compacting context…".to_string(),
             Self::WaitingForResponse => "Waiting for response…".to_string(),
             Self::Thinking => "Thinking…".to_string(),
@@ -314,6 +312,18 @@ pub struct ResumePanel {
     pub expanded: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeleteConfirmation {
+    pub session_id: String,
+    pub title: String,
+}
+
+#[derive(Clone, Debug)]
+struct ModeSwitchBanner {
+    message: String,
+    shown_at: Instant,
+}
+
 impl ResumePanel {
     pub fn visible_sessions(&self) -> Vec<&SessionSummary> {
         let query = self.query.text().trim().to_lowercase();
@@ -337,6 +347,10 @@ pub enum SessionCommand {
     EditPrompt,
     Copy(String),
     Rename(String),
+    Compact(Option<String>),
+    SetMode(SessionMode),
+    SessionInfo,
+    Delete,
 }
 
 pub struct App {
@@ -352,11 +366,13 @@ pub struct App {
     pub permission: Option<PermissionPrompt>,
     pub catalog_modal: Option<CatalogModal>,
     pub resume_panel: Option<ResumePanel>,
+    pub delete_confirmation: Option<DeleteConfirmation>,
     pub session_id: Option<String>,
     pub session_title: Option<String>,
     pub animation_tick: u64,
     pub running: bool,
     pub hit_zones: HitZones,
+    pub session_mode: SessionMode,
     transcript_viewport: TranscriptViewport,
     transcript_scroll: usize,
     transcript_follow: bool,
@@ -366,6 +382,7 @@ pub struct App {
     pending_submission: Option<String>,
     pending_permission_reply: Option<(u64, PermissionReply)>,
     pending_session_command: Option<SessionCommand>,
+    mode_banner: Option<ModeSwitchBanner>,
     thinking_entries: HashMap<String, (usize, Instant)>,
     assistant_entries: HashMap<String, usize>,
     tool_entries: HashMap<String, (usize, Instant)>,
@@ -395,11 +412,13 @@ impl App {
             permission: None,
             catalog_modal: None,
             resume_panel: None,
+            delete_confirmation: None,
             session_id: None,
             session_title: None,
             animation_tick: 0,
             running: true,
             hit_zones: HitZones::default(),
+            session_mode: SessionMode::Normal,
             transcript_viewport: TranscriptViewport::default(),
             transcript_scroll: 0,
             transcript_follow: true,
@@ -409,6 +428,7 @@ impl App {
             pending_submission: None,
             pending_permission_reply: None,
             pending_session_command: None,
+            mode_banner: None,
             thinking_entries: HashMap::new(),
             assistant_entries: HashMap::new(),
             tool_entries: HashMap::new(),
@@ -948,6 +968,43 @@ impl App {
         self.pending_session_command.take()
     }
 
+    pub fn request_next_mode(&mut self) {
+        if self.turn.is_none() && self.delete_confirmation.is_none() {
+            self.pending_session_command = Some(SessionCommand::SetMode(self.session_mode.next()));
+        }
+    }
+
+    pub fn confirm_mode(&mut self, mode: SessionMode) {
+        self.session_mode = mode;
+        self.mode_banner = Some(ModeSwitchBanner {
+            message: format!("Switched to mode: {}", mode.label()),
+            shown_at: Instant::now(),
+        });
+    }
+
+    pub fn mode_banner(&self) -> Option<(&str, f32)> {
+        let banner = self.mode_banner.as_ref()?;
+        let elapsed = banner.shown_at.elapsed();
+        let opacity = if elapsed <= Duration::from_secs(2) {
+            1.0
+        } else {
+            1.0 - (elapsed - Duration::from_secs(2)).as_secs_f32() / 0.3
+        };
+        (opacity > 0.0).then_some((banner.message.as_str(), opacity.clamp(0.0, 1.0)))
+    }
+
+    pub fn confirm_delete(&mut self) -> bool {
+        if self.delete_confirmation.take().is_none() {
+            return false;
+        }
+        self.pending_session_command = Some(SessionCommand::Delete);
+        true
+    }
+
+    pub fn cancel_delete(&mut self) {
+        self.delete_confirmation = None;
+    }
+
     pub fn open_resume_panel(&mut self, sessions: Vec<SessionSummary>) {
         self.close_slash();
         self.catalog_modal = None;
@@ -961,6 +1018,7 @@ impl App {
 
     pub fn close_resume_panel(&mut self) {
         self.resume_panel = None;
+        self.delete_confirmation = None;
     }
 
     pub fn edit_resume_query(&mut self, edit: impl FnOnce(&mut Composer)) {
@@ -1116,6 +1174,14 @@ impl App {
         self.transcript.push(TranscriptEntry::Event(message.into()));
     }
 
+    pub fn report_session_info(&mut self, markdown: impl Into<String>) {
+        self.transcript.push(TranscriptEntry::Assistant {
+            id: format!("session-info-{}", self.animation_tick),
+            text: markdown.into(),
+            streaming: false,
+        });
+    }
+
     pub fn restore_edited_prompt(&mut self, session: &Session, prompt: String) {
         self.load_session(session);
         self.composer.set(prompt);
@@ -1172,12 +1238,6 @@ impl App {
                     turn.run_id = Some(run_id);
                     turn.set_activity(TurnActivity::WaitingForResponse);
                 }
-            }
-            HarnessEvent::ClassifierStarted { .. } => {
-                self.set_turn_activity(TurnActivity::Classifying);
-            }
-            HarnessEvent::ClassifierFinished { .. } => {
-                self.set_turn_activity(TurnActivity::WaitingForResponse);
             }
             HarnessEvent::JobScheduled {
                 job_id,
@@ -1444,6 +1504,7 @@ impl App {
                 };
                 format!("{verb} for {elapsed}")
             }
+            RunOutcome::Compacted => format!("Compacted in {elapsed}"),
             RunOutcome::Scheduled => format!("Scheduled in {elapsed}"),
             RunOutcome::Cancelled => format!("Turn cancelled by user in {elapsed}."),
             RunOutcome::Failed => format!("Turn failed in {elapsed}."),
@@ -1455,6 +1516,13 @@ impl App {
 
     pub fn on_tick(&mut self) {
         self.animation_tick = self.animation_tick.wrapping_add(1);
+        if self
+            .mode_banner
+            .as_ref()
+            .is_some_and(|banner| banner.shown_at.elapsed() >= Duration::from_millis(2_300))
+        {
+            self.mode_banner = None;
+        }
         if self.animation_tick.is_multiple_of(2) {
             match self.selection_autoscroll {
                 -1 => self.scroll_transcript_up(1),
@@ -1524,6 +1592,56 @@ impl App {
             }
             "rename" => {
                 self.pending_session_command = Some(SessionCommand::Rename(args.to_string()))
+            }
+            "compact" => {
+                self.turn = Some(ActiveTurn::new());
+                self.pending_session_command = Some(SessionCommand::Compact(
+                    (!args.is_empty()).then(|| args.to_string()),
+                ));
+            }
+            "plan" => {
+                let mode = if self.session_mode == SessionMode::Plan {
+                    SessionMode::Normal
+                } else {
+                    SessionMode::Plan
+                };
+                self.pending_session_command = Some(SessionCommand::SetMode(mode));
+            }
+            "always-approve" => {
+                let mode = match args {
+                    "" => {
+                        if self.session_mode == SessionMode::AlwaysApprove {
+                            SessionMode::Normal
+                        } else {
+                            SessionMode::AlwaysApprove
+                        }
+                    }
+                    "on" => SessionMode::AlwaysApprove,
+                    "off" => SessionMode::Normal,
+                    _ => {
+                        self.transcript.push(TranscriptEntry::Event(
+                            "Usage: /always-approve [on|off]".to_string(),
+                        ));
+                        return true;
+                    }
+                };
+                self.pending_session_command = Some(SessionCommand::SetMode(mode));
+            }
+            "session-info" => self.pending_session_command = Some(SessionCommand::SessionInfo),
+            "delete" => {
+                if let Some(session_id) = self.session_id.clone() {
+                    self.delete_confirmation = Some(DeleteConfirmation {
+                        session_id,
+                        title: self
+                            .session_title
+                            .clone()
+                            .unwrap_or_else(|| "Untitled session".to_string()),
+                    });
+                } else {
+                    self.transcript.push(TranscriptEntry::Event(
+                        "This conversation has no saved session to delete.".to_string(),
+                    ));
+                }
             }
             "home" => {
                 self.transcript.clear();
@@ -1743,6 +1861,60 @@ mod tests {
         app.composer.set("/new");
         app.submit();
         assert_eq!(app.take_session_command(), Some(SessionCommand::New));
+    }
+
+    #[test]
+    fn mode_controls_follow_the_classifier_free_cycle() {
+        let mut app = App::new();
+        app.request_next_mode();
+        assert_eq!(
+            app.take_session_command(),
+            Some(SessionCommand::SetMode(SessionMode::Plan))
+        );
+        app.confirm_mode(SessionMode::Plan);
+        assert!(
+            app.mode_banner().is_some_and(
+                |(message, opacity)| message == "Switched to mode: Plan" && opacity > 0.0
+            )
+        );
+
+        app.request_next_mode();
+        assert_eq!(
+            app.take_session_command(),
+            Some(SessionCommand::SetMode(SessionMode::AlwaysApprove))
+        );
+        app.confirm_mode(SessionMode::AlwaysApprove);
+        app.request_next_mode();
+        assert_eq!(
+            app.take_session_command(),
+            Some(SessionCommand::SetMode(SessionMode::Normal))
+        );
+    }
+
+    #[test]
+    fn compact_command_preserves_optional_user_guidance() {
+        let mut app = App::new();
+        app.composer.set("/compact retain exact paths");
+        app.submit();
+
+        assert!(app.turn.is_some());
+        assert_eq!(
+            app.take_session_command(),
+            Some(SessionCommand::Compact(Some("retain exact paths".into())))
+        );
+    }
+
+    #[test]
+    fn delete_requires_confirmation_for_an_allocated_session() {
+        let mut app = App::new();
+        app.session_id = Some("ses-i_example".into());
+        app.session_title = Some("Example".into());
+        app.composer.set("/delete");
+        app.submit();
+
+        assert!(app.delete_confirmation.is_some());
+        assert!(app.confirm_delete());
+        assert_eq!(app.take_session_command(), Some(SessionCommand::Delete));
     }
 
     #[test]
