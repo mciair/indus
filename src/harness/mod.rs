@@ -421,6 +421,10 @@ impl Harness {
         }
 
         let run_id = self.next_run_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let turn_system = crate::features::prompt_skill_instructions(
+            &prompt,
+            &std::env::current_dir().unwrap_or_default(),
+        );
         let selection = crate::provider::ProviderStore::load()
             .active_selection()
             .cloned();
@@ -465,6 +469,7 @@ impl Harness {
             session_store: self.session_store.clone(),
             mode: self.mode(),
             identity,
+            turn_system,
         };
         let busy = Arc::clone(&self.busy);
         let active_cancellation = Arc::clone(&self.cancellation);
@@ -529,6 +534,7 @@ impl Harness {
             session_store: self.session_store.clone(),
             mode: self.mode(),
             identity: None,
+            turn_system: Vec::new(),
         };
         let busy = Arc::clone(&self.busy);
         let active_cancellation = Arc::clone(&self.cancellation);
@@ -635,6 +641,7 @@ impl Harness {
             session_store: None,
             mode: self.mode(),
             identity: None,
+            turn_system: Vec::new(),
         };
         let events = self.event_tx.clone();
         let busy = Arc::clone(&self.busy);
@@ -692,6 +699,7 @@ struct Runtime {
     session_store: Option<SessionStore>,
     mode: SessionMode,
     identity: Option<SessionIdentity>,
+    turn_system: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -718,6 +726,7 @@ impl Runtime {
                 (session.next_assistant(parent_id), session.model_messages())
             };
             let mut system = self.config.system.clone();
+            system.extend(self.turn_system.clone());
             if self.mode == SessionMode::Plan {
                 system.push(plan_mode_prompt());
             }
