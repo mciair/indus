@@ -40,7 +40,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         u16::from(app.turn.is_some())
     };
     let prompt_gap = u16::from(turn_height == 0 && area.height > 16);
-    let [top, body, _, turn, prompt] = Layout::vertical([
+    let [top, body, banner, turn, prompt] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(4),
         Constraint::Length(prompt_gap),
@@ -75,6 +75,8 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
     if app.turn.is_some() {
         render_turn_status(frame, turn, app, &theme);
+    } else if let Some((message, opacity)) = app.mode_banner() {
+        render_mode_banner(frame, banner, message, opacity, &theme);
     }
     render_composer(frame, prompt, app, &theme);
     if app.slash.open {
@@ -86,7 +88,30 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(panel) = app.resume_panel.as_ref() {
         render_resume_panel(frame, panel, &theme, &mut zones);
     }
+    if let Some(confirmation) = app.delete_confirmation.as_ref() {
+        render_delete_confirmation(frame, area, confirmation, &theme);
+    }
     app.hit_zones = zones;
+}
+
+fn render_mode_banner(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    message: &str,
+    opacity: f32,
+    theme: &Theme,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let foreground = blend_color(theme.bg_base, theme.text_secondary, opacity);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            format!("  {message}"),
+            Style::default().fg(foreground).bg(theme.bg_base),
+        )),
+        area,
+    );
 }
 
 fn render_top_bar(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
@@ -951,8 +976,7 @@ fn render_turn_status(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Them
         TurnActivity::Retrying(_) => theme.warning,
         TurnActivity::Cancelling => theme.accent_error,
         TurnActivity::WaitingForPermission => theme.warning,
-        TurnActivity::Classifying
-        | TurnActivity::Compacting
+        TurnActivity::Compacting
         | TurnActivity::Thinking
         | TurnActivity::Responding
         | TurnActivity::WaitingForResponse => theme.text_secondary,
@@ -1306,6 +1330,48 @@ fn render_api_key_popover(
     frame.set_cursor_position((cursor_x, input_area.y));
 }
 
+fn render_delete_confirmation(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    confirmation: &crate::app::DeleteConfirmation,
+    theme: &Theme,
+) {
+    let width = 64u16.min(area.width).max(36.min(area.width));
+    let height = 10u16.min(area.height).max(8.min(area.height));
+    let panel = centered_rect(area, width, height);
+    render_popover_surface(frame, panel, theme);
+    render_popover_header(frame, panel, "Delete session?", theme);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                truncate(&confirmation.title, panel.width.saturating_sub(6) as usize),
+                Style::default()
+                    .fg(theme.text_primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                truncate(
+                    &confirmation.session_id,
+                    panel.width.saturating_sub(6) as usize,
+                ),
+                Style::default().fg(theme.gray),
+            ),
+            Line::default(),
+            Line::styled(
+                "This permanently removes the saved conversation history.",
+                Style::default().fg(theme.accent_error),
+            ),
+        ]),
+        Rect::new(
+            panel.x + 3,
+            panel.y + 3,
+            panel.width.saturating_sub(6),
+            panel.height.saturating_sub(5),
+        ),
+    );
+    render_popover_footer(frame, panel, "y/enter delete   n/esc cancel", theme);
+}
+
 fn render_popover_surface(frame: &mut Frame<'_>, panel: Rect, theme: &Theme) {
     frame.render_widget(Clear, panel);
     fill(
@@ -1344,7 +1410,10 @@ fn render_popover_footer(frame: &mut Frame<'_>, panel: Rect, text: &str, theme: 
         if index > 0 {
             spans.push(Span::raw(" "));
         }
-        let is_key = matches!(token, "enter" | "esc" | "↑↓" | "r" | "k");
+        let is_key = matches!(
+            token,
+            "enter" | "esc" | "y/enter" | "n/esc" | "↑↓" | "r" | "k"
+        );
         spans.push(Span::styled(
             token.to_string(),
             Style::default().fg(if is_key {
@@ -1363,6 +1432,36 @@ fn render_popover_footer(frame: &mut Frame<'_>, panel: Rect, text: &str, theme: 
             1,
         ),
     );
+}
+
+fn blend_color(background: Color, foreground: Color, opacity: f32) -> Color {
+    let Some((background_red, background_green, background_blue)) = color_rgb(background) else {
+        return foreground;
+    };
+    let Some((foreground_red, foreground_green, foreground_blue)) = color_rgb(foreground) else {
+        return foreground;
+    };
+    let blend = |background: u8, foreground: u8| {
+        (f32::from(background)
+            + (f32::from(foreground) - f32::from(background)) * opacity.clamp(0.0, 1.0))
+        .round() as u8
+    };
+    Color::Rgb(
+        blend(background_red, foreground_red),
+        blend(background_green, foreground_green),
+        blend(background_blue, foreground_blue),
+    )
+}
+
+fn color_rgb(color: Color) -> Option<(u8, u8, u8)> {
+    match color {
+        Color::Black => Some((0, 0, 0)),
+        Color::White => Some((255, 255, 255)),
+        Color::Gray => Some((128, 128, 128)),
+        Color::DarkGray => Some((64, 64, 64)),
+        Color::Rgb(red, green, blue) => Some((red, green, blue)),
+        _ => None,
+    }
 }
 
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
