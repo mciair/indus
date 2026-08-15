@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ops::Range,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -383,6 +383,7 @@ pub struct App {
     selection_mouse: Option<(u16, u16)>,
     selection_autoscroll: i8,
     pending_submission: Option<String>,
+    queued_prompts: VecDeque<String>,
     pending_permission_reply: Option<(u64, PermissionReply)>,
     pending_session_command: Option<SessionCommand>,
     mode_banner: Option<ModeSwitchBanner>,
@@ -429,6 +430,7 @@ impl App {
             selection_mouse: None,
             selection_autoscroll: 0,
             pending_submission: None,
+            queued_prompts: VecDeque::new(),
             pending_permission_reply: None,
             pending_session_command: None,
             mode_banner: None,
@@ -945,6 +947,13 @@ impl App {
         }
 
         if self.turn.is_some() {
+            self.queued_prompts.push_back(text);
+            self.composer.clear();
+            self.close_slash();
+            self.transcript.push(TranscriptEntry::Event(format!(
+                "Prompt queued ({}). Press Esc to interrupt and send it now.",
+                self.queued_prompts.len()
+            )));
             return;
         }
 
@@ -961,6 +970,18 @@ impl App {
 
     pub fn take_submission(&mut self) -> Option<String> {
         self.pending_submission.take()
+    }
+
+    pub fn restore_submission(&mut self, prompt: String) {
+        self.pending_submission = Some(prompt);
+    }
+
+    pub fn has_queued_prompts(&self) -> bool {
+        !self.queued_prompts.is_empty()
+    }
+
+    pub fn take_queued_prompts(&mut self) -> VecDeque<String> {
+        std::mem::take(&mut self.queued_prompts)
     }
 
     pub fn take_permission_reply(&mut self) -> Option<(u64, PermissionReply)> {
@@ -1097,6 +1118,7 @@ impl App {
         self.resume_panel = None;
         self.session_id = session.is_allocated().then(|| session.id.clone());
         self.session_title = session.title.clone();
+        self.queued_prompts.clear();
         for message in &session.messages {
             match message {
                 SessionMessage::User(message) => self.transcript.push(TranscriptEntry::User {
@@ -1522,6 +1544,20 @@ impl App {
             RunOutcome::StepLimitReached => format!("Step limit reached in {elapsed}."),
         };
         self.transcript.push(TranscriptEntry::Event(message));
+        self.submit_next_queued_prompt();
+    }
+
+    fn submit_next_queued_prompt(&mut self) {
+        let Some(text) = self.queued_prompts.pop_front() else {
+            return;
+        };
+        let slash_tokens = recognized_slash_tokens(&text);
+        self.transcript.push(TranscriptEntry::User {
+            text: text.clone(),
+            slash_tokens,
+        });
+        self.turn = Some(ActiveTurn::new());
+        self.pending_submission = Some(text);
     }
 
     pub fn on_tick(&mut self) {
@@ -1954,6 +1990,33 @@ mod tests {
             app.transcript.last(),
             Some(TranscriptEntry::Event(text)) if text.starts_with("Worked for ")
         ));
+    }
+
+    #[test]
+    fn prompts_queue_fifo_until_each_turn_finishes() {
+        let mut app = App::new();
+        app.composer.set("first");
+        app.submit();
+        assert_eq!(app.take_submission().as_deref(), Some("first"));
+
+        app.composer.set("second");
+        app.submit();
+        app.composer.set("third");
+        app.submit();
+        assert!(app.has_queued_prompts());
+
+        app.apply_harness_event(HarnessEvent::RunFinished {
+            run_id: 1,
+            outcome: RunOutcome::Completed,
+        });
+        assert_eq!(app.take_submission().as_deref(), Some("second"));
+
+        app.apply_harness_event(HarnessEvent::RunFinished {
+            run_id: 2,
+            outcome: RunOutcome::Failed,
+        });
+        assert_eq!(app.take_submission().as_deref(), Some("third"));
+        assert!(!app.has_queued_prompts());
     }
 
     #[test]
