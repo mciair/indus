@@ -368,7 +368,17 @@ fn render_browser_panel(
         inner.height.saturating_sub(4),
     );
     if let Some(detail) = &state.detail {
-        let lines = detail.body.lines().collect::<Vec<_>>();
+        let lines = detail
+            .body
+            .lines()
+            .flat_map(|line| {
+                if line.is_empty() {
+                    vec![String::new()]
+                } else {
+                    wrap_text(line, content.width.max(1) as usize)
+                }
+            })
+            .collect::<Vec<_>>();
         for (offset, line) in lines
             .iter()
             .skip(detail.scroll.min(lines.len().saturating_sub(1)))
@@ -377,7 +387,7 @@ fn render_browser_panel(
         {
             frame.render_widget(
                 Paragraph::new(Line::styled(
-                    truncate(line, content.width as usize),
+                    line.clone(),
                     Style::default().fg(if line.is_empty() {
                         theme.gray_dim
                     } else {
