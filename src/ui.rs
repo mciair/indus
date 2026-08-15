@@ -13,9 +13,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, CatalogModal, HOME_MENU, HitZones, ModelCatalogView, ToolVisualState, TranscriptEntry,
-        TurnActivity,
+        App, BrowserPanel, CatalogModal, HOME_MENU, HitZones, ModelCatalogView, ToolVisualState,
+        TranscriptEntry, TurnActivity,
     },
+    features::BrowserAction,
     harness::event::{DiffKind, FileDiff},
     provider::ProviderId,
     theme::Theme,
@@ -88,6 +89,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
     if let Some(panel) = app.resume_panel.as_ref() {
         render_resume_panel(frame, panel, &theme, &mut zones);
+    }
+    if let Some(panel) = app.browser_panel.as_ref() {
+        render_browser_panel(frame, panel, &theme, &mut zones);
     }
     if let Some(confirmation) = app.delete_confirmation.as_ref() {
         render_delete_confirmation(frame, area, confirmation, &theme);
@@ -316,6 +320,141 @@ fn render_resume_panel(
     ));
 }
 
+fn render_browser_panel(
+    frame: &mut Frame<'_>,
+    state: &BrowserPanel,
+    theme: &Theme,
+    zones: &mut HitZones,
+) {
+    let width = frame.area().width.saturating_sub(4).clamp(52, 96);
+    let height = frame.area().height.saturating_sub(4).clamp(12, 28);
+    let panel = centered_rect(frame.area(), width.min(frame.area().width), height);
+    frame.render_widget(Clear, panel);
+    frame.render_widget(
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.prompt_border))
+            .style(Style::default().bg(theme.bg_light)),
+        panel,
+    );
+    let inner = panel.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    let heading = state
+        .detail
+        .as_ref()
+        .map_or(state.title.as_str(), |detail| detail.title.as_str());
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            truncate(heading, inner.width.saturating_sub(8) as usize),
+            Style::default()
+                .fg(theme.text_primary)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled("esc", Style::default().fg(theme.gray)))
+            .alignment(Alignment::Right),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+
+    let content = Rect::new(
+        inner.x,
+        inner.y + 2,
+        inner.width,
+        inner.height.saturating_sub(4),
+    );
+    if let Some(detail) = &state.detail {
+        let lines = detail.body.lines().collect::<Vec<_>>();
+        for (offset, line) in lines
+            .iter()
+            .skip(detail.scroll.min(lines.len().saturating_sub(1)))
+            .take(content.height as usize)
+            .enumerate()
+        {
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    truncate(line, content.width as usize),
+                    Style::default().fg(if line.is_empty() {
+                        theme.gray_dim
+                    } else {
+                        theme.text_secondary
+                    }),
+                )),
+                Rect::new(content.x, content.y + offset as u16, content.width, 1),
+            );
+        }
+    } else if state.items.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "Nothing is available yet.",
+                Style::default().fg(theme.gray),
+            )),
+            content,
+        );
+    } else {
+        let shown = content.height as usize;
+        let start = state.selected.saturating_add(1).saturating_sub(shown);
+        for (offset, (index, item)) in state
+            .items
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(shown)
+            .enumerate()
+        {
+            let row = Rect::new(content.x, content.y + offset as u16, content.width, 1);
+            let selected = index == state.selected;
+            let background = if selected {
+                theme.bg_visual
+            } else {
+                theme.bg_light
+            };
+            fill(frame.buffer_mut(), row, Style::default().bg(background));
+            let available = row.width.saturating_sub(4) as usize;
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        if selected { "› " } else { "  " },
+                        Style::default().fg(theme.fuzzy_accent).bg(background),
+                    ),
+                    Span::styled(
+                        truncate(&item.title, available / 2),
+                        Style::default()
+                            .fg(theme.text_primary)
+                            .bg(background)
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::styled(
+                        format!("  {}", truncate(&item.description, available / 2)),
+                        Style::default().fg(theme.gray).bg(background),
+                    ),
+                ])),
+                row,
+            );
+            zones.browser_rows.push((row, index));
+        }
+    }
+
+    let footer_text = match state.detail.as_ref().map(|detail| &detail.action) {
+        Some(BrowserAction::InsertSkill(_)) => "enter insert skill   ↑↓ scroll   esc back",
+        Some(BrowserAction::SelectRelease(_)) => "enter select version   ↑↓ scroll   esc back",
+        Some(BrowserAction::None) => "↑↓ scroll   esc back",
+        None => "enter open   ↑↓ navigate   esc close",
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(footer_text, Style::default().fg(theme.gray))),
+        Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+    );
+}
+
 fn relative_time(timestamp: i64) -> String {
     let seconds = (Utc::now().timestamp_millis() - timestamp).max(0) / 1_000;
     match seconds {
@@ -482,7 +621,15 @@ fn render_transcript(
     fill(frame.buffer_mut(), area, theme.base());
     let mut rows = Vec::new();
     let width = area.width.max(1) as usize;
+    app.sync_transcript_timestamps();
     for (index, entry) in app.transcript.iter().enumerate() {
+        if let Some(timestamp) = app.transcript_timestamp(index) {
+            rows.push(TranscriptRow {
+                line: Line::styled(timestamp, Style::default().fg(theme.gray_dim)),
+                background: theme.bg_base,
+                fold_entry: None,
+            });
+        }
         build_transcript_rows(&mut rows, index, entry, width, theme);
     }
     let visible = area.height as usize;
@@ -1107,9 +1254,21 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
         }
     }
 
+    let input_hint = if app.multiline_mode {
+        " · multiline · Ctrl+Enter"
+    } else {
+        ""
+    };
     let info = app.active_model().map_or_else(
-        || format!(" indus · {} ", app.theme_kind.name()),
-        |active| format!(" {} · {} ", active.model_name, active.provider.name()),
+        || format!(" indus · {}{} ", app.theme_kind.name(), input_hint),
+        |active| {
+            format!(
+                " {} · {}{} ",
+                active.model_name,
+                active.provider.name(),
+                input_hint
+            )
+        },
     );
     if info.width() + 4 < area.width as usize {
         frame.render_widget(
