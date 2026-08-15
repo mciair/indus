@@ -61,14 +61,8 @@ pub fn mcp_catalog() -> Vec<BrowserItem> {
 }
 
 pub fn installed_skills(cwd: &Path) -> Vec<BrowserItem> {
-    let mut roots = vec![cwd.join(".indus/skills"), cwd.join(".agents/skills")];
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        roots.push(home.join(".agents/skills"));
-        roots.push(home.join(".codex/skills"));
-    }
-
     let mut files = Vec::new();
-    for root in roots {
+    for root in skill_roots(cwd) {
         collect_skill_files(&root, 0, &mut files);
     }
     files.sort();
@@ -101,6 +95,51 @@ pub fn installed_skills(cwd: &Path) -> Vec<BrowserItem> {
     }
     items.sort_by(|left, right| left.title.cmp(&right.title));
     items
+}
+
+pub fn prompt_skill_instructions(prompt: &str, cwd: &Path) -> Vec<String> {
+    let requested = prompt
+        .split_whitespace()
+        .filter_map(|token| token.strip_prefix('$'))
+        .map(|name| {
+            name.trim_matches(|character: char| {
+                !character.is_alphanumeric() && !matches!(character, '-' | '_' | ':')
+            })
+        })
+        .filter(|name| !name.is_empty())
+        .collect::<HashSet<_>>();
+    if requested.is_empty() {
+        return Vec::new();
+    }
+
+    let mut files = Vec::new();
+    for root in skill_roots(cwd) {
+        collect_skill_files(&root, 0, &mut files);
+    }
+    files.sort();
+    files
+        .into_iter()
+        .filter_map(|path| {
+            let name = path.parent()?.file_name()?.to_string_lossy();
+            requested.contains(name.as_ref()).then(|| {
+                fs::read_to_string(&path).ok().map(|source| {
+                    format!(
+                        "Apply the following selected skill instructions for this turn. User instructions take precedence.\n<skill name=\"{name}\">\n{source}\n</skill>"
+                    )
+                })
+            })?
+        })
+        .take(5)
+        .collect()
+}
+
+fn skill_roots(cwd: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![cwd.join(".indus/skills"), cwd.join(".agents/skills")];
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        roots.push(home.join(".agents/skills"));
+        roots.push(home.join(".codex/skills"));
+    }
+    roots
 }
 
 fn collect_skill_files(root: &Path, depth: usize, output: &mut Vec<PathBuf>) {
@@ -151,5 +190,20 @@ mod tests {
             skill_description("---\ndescription: 'Review Rust code'\n---").as_deref(),
             Some("Review Rust code")
         );
+    }
+
+    #[test]
+    fn prompt_skill_names_ignore_surrounding_punctuation() {
+        let requested = "$rust-review, then continue";
+        let names = requested
+            .split_whitespace()
+            .filter_map(|token| token.strip_prefix('$'))
+            .map(|name| {
+                name.trim_matches(|character: char| {
+                    !character.is_alphanumeric() && !matches!(character, '-' | '_' | ':')
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["rust-review"]);
     }
 }
