@@ -594,7 +594,10 @@ mod tests {
         );
         assert_eq!(title_from_first_prompt(" \n\t "), None);
         assert_eq!(
-            title_from_first_prompt(&"a".repeat(120)).unwrap().chars().count(),
+            title_from_first_prompt(&"a".repeat(120))
+                .unwrap()
+                .chars()
+                .count(),
             100
         );
     }
