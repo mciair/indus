@@ -2004,8 +2004,12 @@ fn markdown_heading(line: &str) -> Option<(usize, &str)> {
         .chars()
         .take_while(|character| *character == '#')
         .count();
-    (level > 0 && level <= 6 && line.as_bytes().get(level) == Some(&b' '))
-        .then_some((level, line[level + 1..].trim()))
+    if level == 0 || level > 6 || line.as_bytes().get(level) != Some(&b' ') {
+        return None;
+    }
+    line.get(level + 1..)
+        .map(str::trim)
+        .map(|heading| (level, heading))
 }
 
 fn ordered_list_item(line: &str) -> Option<(&str, &str)> {
@@ -2312,6 +2316,23 @@ mod tests {
         assert!(rendered.contains("Indus"));
         assert!(rendered.contains("Ready"));
         assert!(rendered.contains('└'));
+    }
+
+    #[test]
+    fn incomplete_markdown_headings_never_slice_past_the_line() {
+        for line in ["#", "##", "######", "#######", "###text"] {
+            assert_eq!(markdown_heading(line), None);
+            let rendered = markdown_lines(
+                line,
+                40,
+                &Theme::for_preference(crate::theme::ThemeKind::IndusNight),
+            );
+            assert!(!rendered.is_empty());
+        }
+        assert_eq!(
+            markdown_heading("## Valid heading"),
+            Some((2, "Valid heading"))
+        );
     }
 
     #[test]
