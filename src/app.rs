@@ -254,6 +254,7 @@ impl TurnActivity {
 pub struct ActiveTurn {
     pub run_id: Option<u64>,
     pub activity: TurnActivity,
+    pub status_visible: bool,
     pub started_at: Instant,
     pub activity_started_at: Instant,
 }
@@ -264,6 +265,7 @@ impl ActiveTurn {
         Self {
             run_id: None,
             activity: TurnActivity::WaitingForResponse,
+            status_visible: true,
             started_at: now,
             activity_started_at: now,
         }
@@ -271,6 +273,7 @@ impl ActiveTurn {
 
     fn set_activity(&mut self, activity: TurnActivity) {
         self.activity = activity;
+        self.status_visible = true;
         self.activity_started_at = Instant::now();
     }
 }
@@ -1334,6 +1337,13 @@ impl App {
                 {
                     *streaming = false;
                 }
+                if self.assistant_entries.is_empty()
+                    && self.thinking_entries.is_empty()
+                    && self.tool_entries.is_empty()
+                    && let Some(turn) = self.turn.as_mut()
+                {
+                    turn.status_visible = false;
+                }
             }
             HarnessEvent::ToolStarted {
                 call_id,
@@ -1968,6 +1978,48 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn responding_status_hides_when_the_response_stream_finishes() {
+        let mut app = App::new();
+        app.composer.set("hello");
+        app.submit();
+        app.apply_harness_event(HarnessEvent::RunStarted { run_id: 1 });
+        app.apply_harness_event(HarnessEvent::TextStarted {
+            run_id: 1,
+            text_id: "answer".into(),
+        });
+        assert!(app.turn.as_ref().is_some_and(|turn| {
+            turn.status_visible && turn.activity == TurnActivity::Responding
+        }));
+
+        app.apply_harness_event(HarnessEvent::TextFinished {
+            run_id: 1,
+            text_id: "answer".into(),
+        });
+
+        assert!(app.turn.as_ref().is_some_and(|turn| !turn.status_visible));
+    }
+
+    #[test]
+    fn compacting_state_becomes_visible_after_a_completed_response() {
+        let mut app = App::new();
+        app.composer.set("hello");
+        app.submit();
+        app.apply_harness_event(HarnessEvent::TextStarted {
+            run_id: 1,
+            text_id: "answer".into(),
+        });
+        app.apply_harness_event(HarnessEvent::TextFinished {
+            run_id: 1,
+            text_id: "answer".into(),
+        });
+        app.apply_harness_event(HarnessEvent::CompactionStarted { run_id: 1 });
+
+        assert!(app.turn.as_ref().is_some_and(|turn| {
+            turn.status_visible && turn.activity == TurnActivity::Compacting
+        }));
     }
 
     #[test]
