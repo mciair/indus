@@ -92,6 +92,13 @@ pub enum SessionMessage {
     Assistant(AssistantMessage),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompactionInput {
+    pub previous_summary: Option<String>,
+    pub history: String,
+    pub preserve_from: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -331,46 +338,69 @@ impl Session {
     }
 
     pub fn summary_source(&self, max_characters: usize) -> String {
-        let mut output = String::new();
-        for message in &self.messages {
-            let block = match message {
-                SessionMessage::User(user) => format!("User:\n{}\n\n", user.text),
-                SessionMessage::Assistant(assistant) => {
-                    let parts = assistant
-                        .parts
-                        .iter()
-                        .filter_map(|part| match part {
-                            AssistantPart::Text(text) => Some(text.text.clone()),
-                            AssistantPart::Tool(tool) => {
-                                let result = match &tool.state {
-                                    ToolState::Completed { output, .. } => output.as_str(),
-                                    ToolState::Failed { message } => message.as_str(),
-                                    ToolState::Pending | ToolState::Running => "incomplete",
-                                };
-                                Some(format!("Tool {}({}) => {result}", tool.name, tool.input))
-                            }
-                            AssistantPart::Reasoning(_) => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    format!("Assistant:\n{parts}\n\n")
-                }
-            };
-            output.push_str(&block);
-            if output.len() > max_characters {
-                let mut start = output.len().saturating_sub(max_characters);
-                while !output.is_char_boundary(start) {
-                    start += 1;
-                }
-                output = format!("[Earlier transcript omitted]\n{}", &output[start..]);
-            }
-        }
-        output
+        summary_source(&self.messages, max_characters)
     }
 
-    pub fn compact(&mut self, summary: impl Into<String>, preserve_messages: usize) {
-        let keep_from = self.messages.len().saturating_sub(preserve_messages);
-        let preserved = self.messages.split_off(keep_from);
+    pub fn compaction_input(
+        &self,
+        preserve_user_turns: usize,
+        max_characters: usize,
+    ) -> Option<CompactionInput> {
+        let user_indices = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| match message {
+                SessionMessage::User(user) if !is_summary(&user.text) => Some(index),
+                SessionMessage::User(_) | SessionMessage::Assistant(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if user_indices.is_empty() {
+            return None;
+        }
+
+        // Keep the requested recent turns verbatim while ensuring there is
+        // always older material for a manual first-turn compaction to summarize.
+        let preserved_turns = preserve_user_turns.min(user_indices.len().saturating_sub(1));
+        let preserve_from = if preserved_turns == 0 {
+            self.messages.len()
+        } else {
+            user_indices[user_indices.len() - preserved_turns]
+        };
+        let previous_summary =
+            self.messages[..preserve_from]
+                .iter()
+                .find_map(|message| match message {
+                    SessionMessage::User(user) => user
+                        .text
+                        .strip_prefix("[Conversation summary]\n")
+                        .map(str::trim)
+                        .filter(|summary| !summary.is_empty())
+                        .map(str::to_string),
+                    SessionMessage::Assistant(_) => None,
+                });
+        let head = self.messages[..preserve_from]
+            .iter()
+            .filter(|message| match message {
+                SessionMessage::User(user) => !is_summary(&user.text),
+                SessionMessage::Assistant(_) => true,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let history = summary_source(&head, max_characters);
+        if history.trim().is_empty() {
+            return None;
+        }
+        Some(CompactionInput {
+            previous_summary,
+            history,
+            preserve_from,
+        })
+    }
+
+    pub fn compact_at(&mut self, summary: impl Into<String>, preserve_from: usize) {
+        let preserve_from = preserve_from.min(self.messages.len());
+        let preserved = self.messages.split_off(preserve_from);
         self.messages.clear();
         let id = self.allocate_message_id();
         self.messages.push(SessionMessage::User(UserMessage {
@@ -378,6 +408,12 @@ impl Session {
             text: format!("[Conversation summary]\n{}", summary.into().trim()),
         }));
         self.messages.extend(preserved);
+        self.touch();
+    }
+
+    pub fn compact(&mut self, summary: impl Into<String>, preserve_messages: usize) {
+        let preserve_from = self.messages.len().saturating_sub(preserve_messages);
+        self.compact_at(summary, preserve_from);
     }
 
     fn allocate_message_id(&mut self) -> u64 {
@@ -390,6 +426,48 @@ impl Session {
             self.updated_at = now_ms();
         }
     }
+}
+
+fn is_summary(text: &str) -> bool {
+    text.starts_with("[Conversation summary]\n")
+}
+
+fn summary_source(messages: &[SessionMessage], max_characters: usize) -> String {
+    let mut output = String::new();
+    for message in messages {
+        let block = match message {
+            SessionMessage::User(user) => format!("User:\n{}\n\n", user.text),
+            SessionMessage::Assistant(assistant) => {
+                let parts = assistant
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        AssistantPart::Text(text) => Some(text.text.clone()),
+                        AssistantPart::Tool(tool) => {
+                            let result = match &tool.state {
+                                ToolState::Completed { output, .. } => output.as_str(),
+                                ToolState::Failed { message } => message.as_str(),
+                                ToolState::Pending | ToolState::Running => "incomplete",
+                            };
+                            Some(format!("Tool {}({}) => {result}", tool.name, tool.input))
+                        }
+                        AssistantPart::Reasoning(_) => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("Assistant:\n{parts}\n\n")
+            }
+        };
+        output.push_str(&block);
+        if output.len() > max_characters {
+            let mut start = output.len().saturating_sub(max_characters);
+            while !output.is_char_boundary(start) {
+                start += 1;
+            }
+            output = format!("[Earlier transcript omitted]\n{}", &output[start..]);
+        }
+    }
+    output
 }
 
 fn now_ms() -> i64 {
@@ -498,5 +576,54 @@ mod tests {
         assert!(session.allocate("ses-i_example", "Initial", None, None));
         assert!(session.rename("Renamed Session"));
         assert_eq!(session.title.as_deref(), Some("Renamed Session"));
+    }
+
+    #[test]
+    fn compaction_preserves_the_two_newest_user_turns() {
+        let mut session = Session::unallocated("/workspace");
+        for prompt in ["first", "second", "third"] {
+            let parent = session.push_user(prompt);
+            let mut answer = session.next_assistant(parent);
+            answer.parts.push(AssistantPart::Text(TextPart {
+                id: format!("answer-{prompt}"),
+                text: format!("answer to {prompt}"),
+                completed: true,
+            }));
+            session.push_assistant(answer);
+        }
+
+        let input = session.compaction_input(2, 90_000).unwrap();
+        assert!(input.history.contains("first"));
+        assert!(!input.history.contains("second"));
+        session.compact_at("anchored summary", input.preserve_from);
+
+        assert_eq!(session.messages.len(), 5);
+        assert!(matches!(
+            &session.messages[0],
+            SessionMessage::User(message) if message.text.contains("anchored summary")
+        ));
+        assert!(matches!(
+            &session.messages[1],
+            SessionMessage::User(message) if message.text == "second"
+        ));
+    }
+
+    #[test]
+    fn subsequent_compaction_extracts_the_previous_anchor() {
+        let mut session = Session::unallocated("/workspace");
+        session.push_user("[Conversation summary]\n## Goal\n- Keep this");
+        for prompt in ["second", "third", "fourth"] {
+            let parent = session.push_user(prompt);
+            let answer = session.next_assistant(parent);
+            session.push_assistant(answer);
+        }
+
+        let input = session.compaction_input(2, 90_000).unwrap();
+        assert_eq!(
+            input.previous_summary.as_deref(),
+            Some("## Goal\n- Keep this")
+        );
+        assert!(input.history.contains("second"));
+        assert!(!input.history.contains("[Conversation summary]"));
     }
 }
