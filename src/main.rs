@@ -536,8 +536,8 @@ fn dispatch_app_commands(
                     app.report_session_error(format!("Could not rename the session: {error:#}"))
                 }
             },
-            SessionCommand::Compact(instructions) => {
-                if let Err(error) = harness.compact_context(instructions) {
+            SessionCommand::Compact => {
+                if let Err(error) = harness.compact_context(None) {
                     app.apply_harness_event(harness::event::HarnessEvent::RunError {
                         run_id: 0,
                         message: format!("Could not compact the conversation: {error:#}"),
