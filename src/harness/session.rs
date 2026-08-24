@@ -345,14 +345,27 @@ impl Session {
     }
 
     pub fn current_context_tokens(&self) -> u64 {
-        self.messages
+        let measured = self
+            .messages
             .iter()
+            .enumerate()
             .rev()
-            .find_map(|message| match message {
-                SessionMessage::Assistant(assistant) => Some(assistant.usage.context_tokens),
-                SessionMessage::User(_) => None,
-            })
-            .unwrap_or(0)
+            .find_map(|(index, message)| match message {
+                SessionMessage::Assistant(assistant) if assistant.usage.context_tokens > 0 => {
+                    Some((index, assistant.usage.context_tokens))
+                }
+                SessionMessage::Assistant(_) | SessionMessage::User(_) => None,
+            });
+
+        // A provider only reports occupancy for a turn it has already served.
+        // Everything appended since that reading - the pending prompt plus every
+        // tool result gathered during this run - still travels in the next
+        // request, so it has to be estimated or the meter reads low at exactly
+        // the moment the threshold matters.
+        let Some((measured_index, measured_tokens)) = measured else {
+            return estimated_tokens(&self.messages);
+        };
+        measured_tokens.saturating_add(estimated_tokens(&self.messages[measured_index + 1..]))
     }
 
     pub fn summary_source(&self, max_characters: usize) -> String {
@@ -418,7 +431,17 @@ impl Session {
 
     pub fn compact_at(&mut self, summary: impl Into<String>, preserve_from: usize) {
         let preserve_from = preserve_from.min(self.messages.len());
-        let preserved = self.messages.split_off(preserve_from);
+        let mut preserved = self.messages.split_off(preserve_from);
+        // The retained turns still carry the occupancy the provider measured
+        // before the transcript shrank. Leaving those readings in place would
+        // keep the context meter pinned above the threshold and compact again
+        // on every following step, so the estimate takes over until the next
+        // request comes back with a fresh measurement.
+        for message in &mut preserved {
+            if let SessionMessage::Assistant(assistant) = message {
+                assistant.usage.context_tokens = 0;
+            }
+        }
         self.messages.clear();
         let id = self.allocate_message_id();
         self.messages.push(SessionMessage::User(UserMessage {
@@ -456,6 +479,47 @@ pub fn title_from_first_prompt(prompt: &str) -> Option<String> {
 
 fn is_summary(text: &str) -> bool {
     text.starts_with("[Conversation summary]\n")
+}
+
+/// Average characters per token across the transcripts these providers bill.
+const CHARACTERS_PER_TOKEN: u64 = 4;
+/// Per-message envelope: role markers, tool-call scaffolding and delimiters.
+const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
+
+/// Approximates how many tokens `messages` will occupy in the next request.
+/// This is deliberately a local estimate: it has to be available before a
+/// request is sent, which is the only point where compaction can still keep the
+/// conversation inside the window.
+fn estimated_tokens(messages: &[SessionMessage]) -> u64 {
+    messages
+        .iter()
+        .map(|message| {
+            let characters = match message {
+                SessionMessage::User(user) => user.text.chars().count() as u64,
+                SessionMessage::Assistant(assistant) => assistant
+                    .parts
+                    .iter()
+                    .map(|part| match part {
+                        AssistantPart::Text(text) => text.text.chars().count() as u64,
+                        // Reasoning is not replayed to the provider, so it is
+                        // excluded from the projection.
+                        AssistantPart::Reasoning(_) => 0,
+                        AssistantPart::Tool(tool) => {
+                            let result = match &tool.state {
+                                ToolState::Completed { output, .. } => output.chars().count(),
+                                ToolState::Failed { message } => message.chars().count(),
+                                ToolState::Pending | ToolState::Running => 0,
+                            };
+                            (tool.name.chars().count() + tool.input.chars().count() + result) as u64
+                        }
+                    })
+                    .sum(),
+            };
+            characters
+                .div_ceil(CHARACTERS_PER_TOKEN)
+                .saturating_add(MESSAGE_OVERHEAD_TOKENS)
+        })
+        .sum()
 }
 
 fn summary_source(messages: &[SessionMessage], max_characters: usize) -> String {
@@ -558,6 +622,51 @@ mod tests {
         session.push_assistant(second_assistant);
 
         assert_eq!(session.current_context_tokens(), 80_000);
+    }
+
+    #[test]
+    fn context_occupancy_projects_material_added_since_the_last_measurement() {
+        let mut session = Session::default();
+        let user = session.push_user("first");
+        let mut assistant = session.next_assistant(user);
+        assistant.usage.context_tokens = 80_000;
+        session.push_assistant(assistant);
+        let measured = session.current_context_tokens();
+
+        session.push_user("x".repeat(4_000).as_str());
+        let projected = session.current_context_tokens();
+
+        assert_eq!(measured, 80_000);
+        assert!(
+            projected >= 81_000,
+            "the pending prompt has to raise occupancy, got {projected}"
+        );
+    }
+
+    #[test]
+    fn compaction_releases_the_occupancy_measured_before_the_transcript_shrank() {
+        let mut session = Session::default();
+        for index in 0..3 {
+            let user = session.push_user(format!("turn {index}"));
+            let mut assistant = session.next_assistant(user);
+            assistant.parts.push(AssistantPart::Text(TextPart {
+                id: format!("text-{index}"),
+                text: "y".repeat(200),
+                completed: true,
+            }));
+            assistant.usage.context_tokens = 180_000;
+            session.push_assistant(assistant);
+        }
+        assert_eq!(session.current_context_tokens(), 180_000);
+
+        let input = session.compaction_input(2, 90_000).unwrap();
+        session.compact_at("short summary", input.preserve_from);
+
+        assert!(
+            session.current_context_tokens() < 1_000,
+            "a compacted transcript must not keep reporting pre-compaction occupancy, got {}",
+            session.current_context_tokens()
+        );
     }
 
     #[test]
