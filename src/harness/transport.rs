@@ -114,6 +114,13 @@ impl ProviderTransport {
             body["tools"] = json!(openai_tools(&request.tools));
             body["tool_choice"] = json!("auto");
         }
+        if let Some(effort) = ProviderStore::load().active_reasoning_effort() {
+            if selection.provider == ProviderId::OpenRouter {
+                body["reasoning"] = json!({ "effort": effort });
+            } else {
+                body["reasoning_effort"] = json!(effort);
+            }
+        }
         let mut builder = self
             .client
             .post(format!(
