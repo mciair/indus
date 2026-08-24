@@ -115,11 +115,7 @@ impl ProviderTransport {
             body["tool_choice"] = json!("auto");
         }
         if let Some(effort) = ProviderStore::load().active_reasoning_effort() {
-            if selection.provider == ProviderId::OpenRouter {
-                body["reasoning"] = json!({ "effort": effort });
-            } else {
-                body["reasoning_effort"] = json!(effort);
-            }
+            apply_reasoning_effort(&mut body, selection.provider, effort);
         }
         let mut builder = self
             .client
@@ -285,6 +281,11 @@ impl ProviderTransport {
         if !request.tools.is_empty() {
             body["tools"] = json!(anthropic_tools(&request.tools));
         }
+        // Anthropic carries effort in `output_config`, which shapes the whole
+        // response rather than only the thinking blocks.
+        if let Some(effort) = ProviderStore::load().active_reasoning_effort() {
+            apply_reasoning_effort(&mut body, selection.provider, effort);
+        }
         let response = send(
             self.client
                 .post(format!("{}/messages", selection.provider.base_url()))
@@ -431,6 +432,11 @@ impl ProviderTransport {
         });
         if !request.tools.is_empty() {
             body["tools"] = json!([{ "functionDeclarations": gemini_tools(&request.tools) }]);
+        }
+        // Gemini names the same control `thinkingLevel`, nested inside the
+        // generation config.
+        if let Some(effort) = ProviderStore::load().active_reasoning_effort() {
+            apply_reasoning_effort(&mut body, selection.provider, effort);
         }
         let response = send(
             self.client
@@ -858,6 +864,22 @@ fn stop_reason(value: &str) -> StopReason {
     }
 }
 
+/// Places the selected reasoning effort in a request body.
+///
+/// Every provider gates the same behaviour behind a different field, and a
+/// value written in the wrong shape is silently ignored rather than rejected,
+/// so the mapping is kept in one place.
+fn apply_reasoning_effort(body: &mut Value, provider: ProviderId, effort: &str) {
+    match provider {
+        ProviderId::OpenAi | ProviderId::Groq => body["reasoning_effort"] = json!(effort),
+        ProviderId::OpenRouter => body["reasoning"] = json!({ "effort": effort }),
+        ProviderId::Anthropic => body["output_config"] = json!({ "effort": effort }),
+        ProviderId::Gemini => {
+            body["generationConfig"]["thinkingConfig"] = json!({ "thinkingLevel": effort });
+        }
+    }
+}
+
 fn openai_usage(value: &Value) -> Usage {
     let input_tokens = value
         .get("prompt_tokens")
@@ -1073,5 +1095,34 @@ mod tests {
             }),
         );
         assert_eq!(usage.context_tokens, 83_000);
+    }
+
+    #[test]
+    fn every_provider_receives_reasoning_effort_in_its_own_shape() {
+        let mut openai = json!({ "model": "gpt-5.1" });
+        apply_reasoning_effort(&mut openai, ProviderId::OpenAi, "high");
+        assert_eq!(openai["reasoning_effort"], "high");
+
+        let mut groq = json!({ "model": "openai/gpt-oss-120b" });
+        apply_reasoning_effort(&mut groq, ProviderId::Groq, "low");
+        assert_eq!(groq["reasoning_effort"], "low");
+
+        let mut openrouter = json!({ "model": "openai/gpt-5.1" });
+        apply_reasoning_effort(&mut openrouter, ProviderId::OpenRouter, "medium");
+        assert_eq!(openrouter["reasoning"]["effort"], "medium");
+
+        let mut anthropic = json!({ "model": "claude-opus-4-5" });
+        apply_reasoning_effort(&mut anthropic, ProviderId::Anthropic, "max");
+        assert_eq!(anthropic["output_config"]["effort"], "max");
+
+        // Gemini nests the control, so the existing generation config has to
+        // survive the write.
+        let mut gemini = json!({ "generationConfig": { "maxOutputTokens": 16384 } });
+        apply_reasoning_effort(&mut gemini, ProviderId::Gemini, "low");
+        assert_eq!(
+            gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "low"
+        );
+        assert_eq!(gemini["generationConfig"]["maxOutputTokens"], 16384);
     }
 }
