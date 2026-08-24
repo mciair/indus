@@ -1,0 +1,6 @@
+[target.x86_64-unknown-linux-gnu]
+linker = "/usr/bin/cc"
+
+[env]
+CC_x86_64_unknown_linux_gnu = { value = "/usr/bin/cc", force = true }
+CXX_x86_64_unknown_linux_gnu = { value = "/usr/bin/c++", force = true }
