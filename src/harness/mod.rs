@@ -122,10 +122,21 @@ pub struct Harness {
     event_rx: Mutex<Receiver<HarnessEvent>>,
     busy: Arc<AtomicBool>,
     next_run_id: AtomicU64,
+    next_btw_id: AtomicU64,
     cancellation: Arc<Mutex<Option<CancellationToken>>>,
     jobs: JobService,
     session_store: Option<SessionStore>,
     mode: Arc<Mutex<SessionMode>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageSnapshot {
+    pub model: String,
+    pub directory: String,
+    pub permissions: String,
+    pub session: String,
+    pub context_used: u64,
+    pub context_window: Option<u64>,
 }
 
 impl Harness {
@@ -146,6 +157,7 @@ impl Harness {
             event_rx: Mutex::new(event_rx),
             busy: Arc::new(AtomicBool::new(false)),
             next_run_id: AtomicU64::new(0),
+            next_btw_id: AtomicU64::new(0),
             cancellation: Arc::new(Mutex::new(None)),
             jobs: JobService::load(),
             session_store: None,
@@ -192,6 +204,7 @@ impl Harness {
             event_rx: Mutex::new(event_rx),
             busy: Arc::new(AtomicBool::new(false)),
             next_run_id: AtomicU64::new(0),
+            next_btw_id: AtomicU64::new(0),
             cancellation: Arc::new(Mutex::new(None)),
             jobs,
             session_store: Some(session_store),
@@ -492,6 +505,105 @@ impl Harness {
             *active = None;
         });
         Ok(run_id)
+    }
+
+    pub fn submit_btw(&self, question: impl Into<String>) -> anyhow::Result<u64> {
+        let question = question.into();
+        if question.trim().is_empty() {
+            return Err(anyhow::anyhow!(HarnessError::EmptyPrompt));
+        }
+        let mut messages = self.session_snapshot().model_messages();
+        if messages.is_empty() {
+            return Err(anyhow::anyhow!("There is no active conversation for /btw"));
+        }
+        messages.push(ModelMessage {
+            role: Role::User,
+            content: vec![ModelContent::Text(question.clone())],
+        });
+        let request_id = self.next_btw_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let transport = Arc::clone(&self.transport);
+        let events = self.event_tx.clone();
+        let mut system = self.config.system.clone();
+        system.push(
+            [
+                "This is a non-blocking /btw side question about the active conversation.",
+                "Answer the question directly and concisely without tools.",
+                "Do not continue, alter, or summarize the main task.",
+            ]
+            .join("\n"),
+        );
+        thread::spawn(move || {
+            let request = ModelRequest {
+                system,
+                messages,
+                tools: Vec::new(),
+                step: 1,
+            };
+            let cancellation = CancellationToken::default();
+            let mut answer = String::new();
+            let result = transport
+                .stream(
+                    request,
+                    &mut |event| {
+                        if let model::ModelEvent::TextDelta { text, .. } = event {
+                            answer.push_str(&text);
+                        }
+                        Ok(())
+                    },
+                    &cancellation,
+                )
+                .and_then(|()| {
+                    if answer.trim().is_empty() {
+                        Err(TransportError::fatal(
+                            "The provider returned an empty /btw answer",
+                        ))
+                    } else {
+                        Ok(answer)
+                    }
+                })
+                .map_err(|error| error.to_string());
+            let _ = events.send(HarnessEvent::BtwFinished {
+                request_id,
+                question,
+                result,
+            });
+        });
+        Ok(request_id)
+    }
+
+    pub fn usage_snapshot(&self) -> UsageSnapshot {
+        let session = self.session_snapshot();
+        let model = crate::provider::ProviderStore::load()
+            .active_selection()
+            .map(|selection| format!("{} · {}", selection.model_name, selection.provider.name()))
+            .unwrap_or_else(|| "Not selected".to_string());
+        let mode = self.mode();
+        UsageSnapshot {
+            model,
+            directory: if session.directory.is_empty() {
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                session.directory.clone()
+            },
+            permissions: match mode {
+                SessionMode::Normal => "Normal · asks before protected actions",
+                SessionMode::Plan => "Plan · read-only",
+                SessionMode::AlwaysApprove => "Always-Approve",
+            }
+            .to_string(),
+            session: if session.is_allocated() {
+                session.id.clone()
+            } else if session.ephemeral {
+                "Ephemeral fork".to_string()
+            } else {
+                "Not allocated yet".to_string()
+            },
+            context_used: session.current_context_tokens(),
+            context_window: self.transport.context_window(),
+        }
     }
 
     pub fn compact_context(&self, instructions: Option<String>) -> anyhow::Result<u64> {
@@ -1331,6 +1443,38 @@ mod tests {
                 reason: StopReason::Stop,
                 usage: Usage::default(),
             })
+        }
+    }
+
+    #[test]
+    fn btw_uses_conversation_context_without_claiming_main_busy_state() {
+        let harness = Harness::new(
+            Arc::new(TextTransport),
+            ToolRegistry::default(),
+            PermissionService::default(),
+            HarnessConfig::default(),
+        );
+        harness.submit("Main request").unwrap();
+        let request_id = harness.submit_btw("What is the current task?").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some((seen_id, result)) =
+                harness
+                    .drain_events()
+                    .into_iter()
+                    .find_map(|event| match event {
+                        HarnessEvent::BtwFinished {
+                            request_id, result, ..
+                        } => Some((request_id, result)),
+                        _ => None,
+                    })
+            {
+                assert_eq!(seen_id, request_id);
+                assert_eq!(result.as_deref(), Ok("Hello from Indus"));
+                break;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for /btw");
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
