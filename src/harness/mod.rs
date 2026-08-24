@@ -947,16 +947,21 @@ impl Runtime {
             if blocked {
                 return self.finish(run_id, RunOutcome::Failed);
             }
+            if outcome == ProcessOutcome::Stop {
+                self.ensure_session_identity(run_id);
+                return self.finish(run_id, RunOutcome::Completed);
+            }
+            // Compaction is never the last thing a turn does. Reaching here
+            // means the model has more work, so the transcript is shrunk and
+            // the loop carries straight on with the compacted context. A turn
+            // that has already finished is left alone; the pre-flight check at
+            // the top of the loop compacts before the next request instead.
             if !compaction_exhausted && self.should_compact() {
                 if !self.compact(run_id, None) {
                     self.emit(HarnessEvent::CompactionRequired { run_id });
                     return self.finish(run_id, RunOutcome::CompactionRequired);
                 }
                 compaction_exhausted = self.should_compact();
-            }
-            if outcome == ProcessOutcome::Stop {
-                self.ensure_session_identity(run_id);
-                return self.finish(run_id, RunOutcome::Completed);
             }
         }
 
@@ -1618,6 +1623,54 @@ mod tests {
         }
     }
 
+    /// Calls a tool on its first step while reporting occupancy past the
+    /// threshold, then answers on the step after. Compaction therefore has to
+    /// happen with work still outstanding.
+    struct MidRunThresholdTransport {
+        calls: AtomicU64,
+    }
+
+    impl ModelTransport for MidRunThresholdTransport {
+        fn context_window(&self) -> Option<u64> {
+            Some(1_000)
+        }
+
+        fn stream(
+            &self,
+            _request: ModelRequest,
+            on_event: &mut dyn FnMut(ModelEvent) -> Result<(), TransportError>,
+            _cancellation: &CancellationToken,
+        ) -> Result<(), TransportError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                on_event(ModelEvent::ToolCall {
+                    id: "call-1".into(),
+                    name: "status".into(),
+                    input: "repository".into(),
+                })?;
+                return on_event(ModelEvent::StepFinished {
+                    reason: StopReason::ToolCalls,
+                    usage: Usage {
+                        context_tokens: 900,
+                        ..Usage::default()
+                    },
+                });
+            }
+            on_event(ModelEvent::TextStarted { id: "t2".into() })?;
+            on_event(ModelEvent::TextDelta {
+                id: "t2".into(),
+                text: "Finished with the compacted context.".into(),
+            })?;
+            on_event(ModelEvent::TextFinished { id: "t2".into() })?;
+            on_event(ModelEvent::StepFinished {
+                reason: StopReason::Stop,
+                usage: Usage {
+                    context_tokens: 200,
+                    ..Usage::default()
+                },
+            })
+        }
+    }
+
     struct StatusTool;
 
     impl HarnessTool for StatusTool {
@@ -1746,8 +1799,10 @@ mod tests {
     }
 
     #[test]
-    fn crossing_the_threshold_compacts_without_being_asked() {
-        // 900 of a 1,000 token window is 90%, past the 85% default.
+    fn a_finished_answer_is_not_followed_by_compaction() {
+        // 900 of a 1,000 token window is 90%, past the 85% default, but the
+        // model has already stopped: compaction belongs to the next request,
+        // not to the tail of a turn that is over.
         let harness = Harness::new(
             Arc::new(ThresholdTransport::new(1_000, 900)),
             ToolRegistry::default(),
@@ -1758,15 +1813,10 @@ mod tests {
         let events = drain_until_finished(&harness);
 
         assert!(
-            events
+            !events
                 .iter()
                 .any(|event| matches!(event, HarnessEvent::CompactionStarted { .. })),
-            "occupancy past the threshold has to start compaction"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, HarnessEvent::CompactionFinished { .. }))
+            "a completed turn must not trail a compaction behind the answer"
         );
         assert!(events.iter().any(|event| matches!(
             event,
@@ -1775,11 +1825,51 @@ mod tests {
                 ..
             }
         )));
-        assert!(matches!(
-            &harness.session_snapshot().messages[0],
-            session::SessionMessage::User(message)
-                if message.text.starts_with("[Conversation summary]")
-        ));
+    }
+
+    #[test]
+    fn compaction_continues_the_run_instead_of_ending_the_turn() {
+        let tools = ToolRegistry::default();
+        tools.register(StatusTool);
+        let permissions = PermissionService::new(vec![PermissionRule {
+            permission: "status".into(),
+            pattern: "*".into(),
+            action: PermissionAction::Allow,
+        }]);
+        let harness = Harness::new(
+            Arc::new(MidRunThresholdTransport {
+                calls: AtomicU64::new(0),
+            }),
+            tools,
+            permissions,
+            HarnessConfig::default(),
+        );
+        harness.submit("inspect the repository").unwrap();
+        let events = drain_until_finished(&harness);
+
+        let compaction = events
+            .iter()
+            .position(|event| matches!(event, HarnessEvent::CompactionFinished { .. }))
+            .expect("crossing the threshold mid-run has to compact");
+        // The model must be asked again after the transcript shrinks, and the
+        // turn must reach its answer rather than stopping at the compaction.
+        assert!(
+            events[compaction..]
+                .iter()
+                .any(|event| matches!(event, HarnessEvent::WaitingForResponse { .. })),
+            "the run has to continue with the compacted context"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HarnessEvent::TextDelta { text, .. } if text == "Finished with the compacted context."
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HarnessEvent::RunFinished {
+                outcome: RunOutcome::Completed,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -1874,35 +1964,46 @@ mod tests {
 
     #[test]
     fn a_compacted_transcript_does_not_compact_again_on_the_next_turn() {
-        let transport = Arc::new(ThresholdTransport::new(1_000, 900));
         let harness = Harness::new(
-            transport.clone(),
+            Arc::new(ThresholdTransport::new(1_000, 900)),
             ToolRegistry::default(),
             PermissionService::default(),
             HarnessConfig::default(),
         );
         harness.submit("first request").unwrap();
-        let first = drain_until_finished(&harness);
+        drain_until_finished(&harness);
+
+        // The first turn left the transcript past the threshold, so this one
+        // compacts before it sends anything.
+        harness.submit("second request").unwrap();
+        let second = drain_until_finished(&harness);
         assert_eq!(
-            first
+            second
                 .iter()
                 .filter(|event| matches!(event, HarnessEvent::CompactionStarted { .. }))
                 .count(),
             1,
-            "the first turn should compact exactly once"
+            "a turn compacts once for the reading it inherited, not repeatedly"
         );
-
-        // The retained turn still carries the pre-compaction reading, so a
-        // second turn would compact again if that reading were trusted.
-        harness.submit("second request").unwrap();
-        let second = drain_until_finished(&harness);
-        let compactions = second
-            .iter()
-            .filter(|event| matches!(event, HarnessEvent::CompactionStarted { .. }))
-            .count();
-        assert_eq!(
-            compactions, 1,
-            "the second turn should compact once for its own fresh reading, not repeatedly"
+        assert!(second.iter().any(|event| matches!(
+            event,
+            HarnessEvent::RunFinished {
+                outcome: RunOutcome::Completed,
+                ..
+            }
+        )));
+        assert!(
+            harness
+                .session_snapshot()
+                .messages
+                .iter()
+                .filter(|message| matches!(
+                    message,
+                    session::SessionMessage::User(user) if user.is_context_summary()
+                ))
+                .count()
+                >= 1,
+            "the compacted transcript keeps its summary anchor"
         );
     }
 
