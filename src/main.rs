@@ -261,6 +261,12 @@ fn handle_key(app: &mut App, harness: &Harness, key: KeyEvent) {
         KeyCode::Down if app.transcript.is_empty() && app.composer.is_empty() => {
             app.selected_menu = (app.selected_menu + 1).min(app::HOME_MENU.len() - 1);
         }
+        KeyCode::Up => {
+            app.navigate_prompt_history(-1);
+        }
+        KeyCode::Down => {
+            app.navigate_prompt_history(1);
+        }
         KeyCode::Enter if app.multiline_mode && !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.edit_composer(|composer| composer.insert_newline());
         }
@@ -458,7 +464,19 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => app.move_browser_selection(-1),
             MouseEventKind::ScrollDown => app.move_browser_selection(1),
+            MouseEventKind::Drag(MouseButton::Left) if app.is_selecting_browser_text() => {
+                app.update_browser_text_selection(x, y);
+            }
+            MouseEventKind::Up(MouseButton::Left) if app.is_selecting_browser_text() => {
+                if let Some(text) = app.finish_browser_text_selection() {
+                    copy_to_clipboard(&text);
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
+                if app.browser_detail_contains(x, y) {
+                    app.begin_browser_text_selection(x, y);
+                    return;
+                }
                 let hit = app
                     .hit_zones
                     .browser_rows
