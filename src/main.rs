@@ -20,7 +20,8 @@ use app::{App, SessionCommand};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -34,12 +35,28 @@ fn main() -> Result<()> {
     let mut harness = Harness::configured_with_session(resume_id.as_deref())?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
+    let enhanced_keyboard = matches!(
+        crossterm::terminal::supports_keyboard_enhancement(),
+        Ok(true)
+    );
+    if enhanced_keyboard {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
+        )?;
+    }
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = run(&mut terminal, &mut harness);
     let session = harness.session_snapshot();
     disable_raw_mode()?;
+    if enhanced_keyboard {
+        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
+    }
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
@@ -169,6 +186,10 @@ fn handle_key(app: &mut App, harness: &Harness, key: KeyEvent) {
         }
         return;
     }
+    if key.code == KeyCode::Esc && app.btw_panel.is_some() {
+        app.dismiss_btw();
+        return;
+    }
     if key.code == KeyCode::Esc && app.turn.is_some() && app.has_queued_prompts() {
         harness.cancel();
         app.cancel_turn();
@@ -188,6 +209,17 @@ fn handle_key(app: &mut App, harness: &Harness, key: KeyEvent) {
 
     if app.slash.open && handle_slash_key(app, key) {
         return;
+    }
+
+    if app.vim_mode {
+        if app.vim_insert_mode {
+            if key.code == KeyCode::Esc {
+                app.set_vim_insert_mode(false);
+                return;
+            }
+        } else if handle_vim_normal_key(app, key) {
+            return;
+        }
     }
 
     if app.catalog_modal.is_none() && !app.transcript.is_empty() {
@@ -254,6 +286,36 @@ fn handle_key(app: &mut App, harness: &Harness, key: KeyEvent) {
         }
         _ => {}
     }
+}
+
+fn handle_vim_normal_key(app: &mut App, key: KeyEvent) -> bool {
+    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+        return false;
+    }
+    match key.code {
+        KeyCode::Char('i') => app.set_vim_insert_mode(true),
+        KeyCode::Char('a') => {
+            app.edit_composer(|composer| composer.move_right());
+            app.set_vim_insert_mode(true);
+        }
+        KeyCode::Char('I') => {
+            app.edit_composer(|composer| composer.move_home());
+            app.set_vim_insert_mode(true);
+        }
+        KeyCode::Char('A') => {
+            app.edit_composer(|composer| composer.move_end());
+            app.set_vim_insert_mode(true);
+        }
+        KeyCode::Char('h') | KeyCode::Left => app.edit_composer(|composer| composer.move_left()),
+        KeyCode::Char('l') | KeyCode::Right => app.edit_composer(|composer| composer.move_right()),
+        KeyCode::Char('0') | KeyCode::Home => app.edit_composer(|composer| composer.move_home()),
+        KeyCode::Char('$') | KeyCode::End => app.edit_composer(|composer| composer.move_end()),
+        KeyCode::Char('x') | KeyCode::Delete => app.edit_composer(|composer| composer.delete()),
+        KeyCode::Enter => app.submit(),
+        KeyCode::Esc => {}
+        _ => return true,
+    }
+    true
 }
 
 fn handle_browser_key(app: &mut App, key: KeyEvent) {
@@ -691,6 +753,17 @@ fn dispatch_app_commands(
                     )
                 });
             }
+            SessionCommand::Btw(question) => {
+                if let Err(error) = harness.submit_btw(question.clone()) {
+                    app.apply_harness_event(harness::event::HarnessEvent::BtwFinished {
+                        request_id: 0,
+                        question,
+                        result: Err(format!("Could not ask the side question: {error:#}")),
+                    });
+                }
+            }
+            SessionCommand::OpenDocs => open_url("https://docs.mciair.in"),
+            SessionCommand::Usage => app.report_usage(harness.usage_snapshot()),
         }
     }
     if let Some(prompt) = app.take_submission() {
@@ -846,14 +919,16 @@ fn contains(area: ratatui::layout::Rect, x: u16, y: u16) -> bool {
 }
 
 fn open_alpha() {
+    open_url(ui::ALPHA_URL);
+}
+
+fn open_url(url: &str) {
     let _ = if cfg!(target_os = "macos") {
-        Command::new("open").arg(ui::ALPHA_URL).status()
+        Command::new("open").arg(url).status()
     } else if cfg!(target_os = "windows") {
-        Command::new("cmd")
-            .args(["/C", "start", ui::ALPHA_URL])
-            .status()
+        Command::new("cmd").args(["/C", "start", url]).status()
     } else {
-        Command::new("xdg-open").arg(ui::ALPHA_URL).status()
+        Command::new("xdg-open").arg(url).status()
     };
 }
 
@@ -926,8 +1001,12 @@ fn encode_base64(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_base64, resume_hint};
-    use crate::harness::session::Session;
+    use super::{encode_base64, handle_key, resume_hint};
+    use crate::{
+        app::App,
+        harness::{Harness, session::Session},
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn osc52_payload_uses_standard_base64_padding() {
@@ -950,5 +1029,46 @@ mod tests {
     #[test]
     fn unallocated_conversations_do_not_print_a_resume_command() {
         assert_eq!(resume_hint(&Session::unallocated("/workspace")), None);
+    }
+
+    #[test]
+    fn ctrl_enter_submits_multiline_input() {
+        let mut app = App::new();
+        let harness = Harness::provider_neutral();
+        app.multiline_mode = true;
+        app.composer.set("first line\nsecond line");
+
+        handle_key(
+            &mut app,
+            &harness,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(
+            app.take_submission().as_deref(),
+            Some("first line\nsecond line")
+        );
+    }
+
+    #[test]
+    fn vim_normal_mode_navigates_and_returns_to_insert_mode() {
+        let mut app = App::new();
+        let harness = Harness::provider_neutral();
+        app.vim_mode = true;
+        app.vim_insert_mode = false;
+        app.composer.set("abc");
+
+        handle_key(
+            &mut app,
+            &harness,
+            KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.composer.cursor(), 0);
+        handle_key(
+            &mut app,
+            &harness,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        );
+        assert!(app.vim_insert_mode);
     }
 }
