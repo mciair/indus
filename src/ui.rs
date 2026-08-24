@@ -13,8 +13,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, BrowserPanel, CatalogModal, HOME_MENU, HitZones, ModelCatalogView, ToolVisualState,
-        TranscriptEntry, TurnActivity,
+        App, BrowserPanel, BtwPanel, CatalogModal, HOME_MENU, HitZones, ModelCatalogView,
+        ToolVisualState, TranscriptEntry, TurnActivity, UsageCard,
     },
     features::BrowserAction,
     harness::event::{DiffKind, FileDiff},
@@ -36,16 +36,18 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let prompt_width = area.width.saturating_sub(4).max(4);
     let prompt_height = composer_height(app.composer.text(), prompt_width.saturating_sub(8));
     let turn_status_visible = app.turn.as_ref().is_some_and(|turn| turn.status_visible);
+    let btw_height = live_btw_height(app.btw_panel.as_ref(), prompt_width);
     let turn_height = if app.permission.is_some() {
         3
     } else {
         u16::from(turn_status_visible)
     };
     let prompt_gap = u16::from(turn_height == 0 && area.height > 16);
-    let [top, body, banner, turn, prompt] = Layout::vertical([
+    let [top, body, banner, btw, turn, prompt] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(4),
         Constraint::Length(prompt_gap),
+        Constraint::Length(btw_height),
         Constraint::Length(turn_height),
         Constraint::Length(prompt_height),
     ])
@@ -67,6 +69,11 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         width: prompt.width.saturating_sub(4),
         ..turn
     };
+    let btw = Rect {
+        x: prompt.x,
+        width: prompt.width,
+        ..btw
+    };
 
     let mut zones = HitZones::default();
     render_top_bar(frame, top, app, &theme);
@@ -79,6 +86,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_turn_status(frame, turn, app, &theme);
     } else if let Some((message, opacity)) = app.mode_banner() {
         render_mode_banner(frame, banner, message, opacity, &theme);
+    }
+    if let Some(panel) = app.btw_panel.as_ref() {
+        render_live_btw(frame, btw, panel, app.animation_tick, &theme);
     }
     render_composer(frame, prompt, app, &theme);
     if app.slash.open {
@@ -97,6 +107,98 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_delete_confirmation(frame, area, confirmation, &theme);
     }
     app.hit_zones = zones;
+}
+
+fn live_btw_height(panel: Option<&BtwPanel>, width: u16) -> u16 {
+    match panel {
+        None => 0,
+        Some(BtwPanel::Loading { .. }) | Some(BtwPanel::Error { .. }) => 3,
+        Some(BtwPanel::Done { answer, .. }) => {
+            let body_width = width.saturating_sub(4).max(1) as usize;
+            let lines = answer
+                .lines()
+                .map(|line| wrap_text(line, body_width).len().max(1))
+                .sum::<usize>()
+                .clamp(1, 12);
+            lines as u16 + 2
+        }
+    }
+}
+
+fn render_live_btw(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    panel: &BtwPanel,
+    animation_tick: u64,
+    theme: &Theme,
+) {
+    if area.width < 12 || area.height < 3 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.gray_dim))
+            .style(Style::default().bg(theme.bg_base)),
+        area,
+    );
+    let hint = " [Esc] ";
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            hint,
+            Style::default().fg(theme.gray).bg(theme.bg_base),
+        )),
+        Rect::new(
+            area.right().saturating_sub(hint.width() as u16 + 1),
+            area.y,
+            hint.width() as u16,
+            1,
+        ),
+    );
+    let max_title = area.width.saturating_sub(hint.width() as u16 + 6) as usize;
+    let title = format!(" /btw {} ", truncate(panel.question(), max_title));
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            title,
+            Style::default()
+                .fg(theme.accent_user)
+                .bg(theme.bg_base)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Rect::new(area.x + 1, area.y, area.width.saturating_sub(10), 1),
+    );
+    let body = area.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    match panel {
+        BtwPanel::Loading { .. } => {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let spinner = frames[(animation_tick as usize / 2) % frames.len()];
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    format!("{spinner} Answering…"),
+                    Style::default().fg(theme.gray),
+                )),
+                body,
+            );
+        }
+        BtwPanel::Done { answer, .. } => {
+            frame.render_widget(
+                Paragraph::new(markdown_lines(answer, body.width.max(1) as usize, theme)),
+                body,
+            );
+        }
+        BtwPanel::Error { message, .. } => frame.render_widget(
+            Paragraph::new(Line::styled(
+                truncate(message, body.width as usize),
+                Style::default().fg(theme.accent_error),
+            )),
+            body,
+        ),
+    }
 }
 
 fn render_mode_banner(
@@ -922,6 +1024,48 @@ fn build_transcript_rows(
                 render_file_diffs(rows, diffs, width, entry_index, theme);
             }
         }
+        TranscriptEntry::Btw {
+            question,
+            answer,
+            expanded,
+        } => {
+            rows.push(TranscriptRow {
+                line: Line::from(vec![
+                    Span::styled(
+                        "◇ /btw ",
+                        Style::default()
+                            .fg(theme.accent_user)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        truncate(question, width.saturating_sub(20)),
+                        Style::default().fg(theme.text_secondary),
+                    ),
+                    Span::styled(
+                        if *expanded {
+                            "  (ctrl+e to collapse)"
+                        } else {
+                            "  (ctrl+e to expand)"
+                        },
+                        Style::default().fg(theme.gray_dim),
+                    ),
+                ]),
+                background: theme.bg_base,
+                fold_entry: Some(entry_index),
+            });
+            if *expanded {
+                for line in markdown_lines(answer, width.saturating_sub(2).max(1), theme) {
+                    let mut spans = vec![Span::raw("  ")];
+                    spans.extend(line.spans);
+                    rows.push(TranscriptRow {
+                        line: Line::from(spans),
+                        background: theme.bg_base,
+                        fold_entry: Some(entry_index),
+                    });
+                }
+            }
+        }
+        TranscriptEntry::Usage(card) => render_usage_card(rows, card, width, theme),
         TranscriptEntry::Event(text) => {
             if !rows.is_empty() {
                 rows.push(blank_row(theme.bg_base));
@@ -935,6 +1079,108 @@ fn build_transcript_rows(
                 fold_entry: None,
             });
         }
+    }
+}
+
+fn render_usage_card(rows: &mut Vec<TranscriptRow>, card: &UsageCard, width: usize, theme: &Theme) {
+    if !rows.is_empty() {
+        rows.push(blank_row(theme.bg_base));
+    }
+    let card_width = width.clamp(32, 96);
+    let horizontal = "─".repeat(card_width.saturating_sub(2));
+    rows.push(usage_row(
+        Line::from(vec![
+            Span::styled("╭─ ", Style::default().fg(theme.gray_dim)),
+            Span::styled(
+                "Indus",
+                Style::default()
+                    .fg(theme.text_primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {}╮", "─".repeat(card_width.saturating_sub(10))),
+                Style::default().fg(theme.gray_dim),
+            ),
+        ]),
+        theme,
+    ));
+    let fields = [
+        ("Model", card.model.clone()),
+        ("Directory", card.directory.clone()),
+        ("Permissions", card.permissions.clone()),
+        ("Session", card.session.clone()),
+    ];
+    for (label, value) in fields {
+        rows.push(usage_field_row(label, &value, card_width, theme));
+    }
+    let context = match card.context_window.filter(|window| *window > 0) {
+        Some(window) => {
+            let used = card.context_used.min(window);
+            let percent_left = 100u64.saturating_sub(used.saturating_mul(100) / window);
+            format!(
+                "{}  {percent_left}% left  {} used / {}",
+                context_progress_bar(percent_left),
+                format_tokens(used),
+                format_tokens(window)
+            )
+        }
+        None => "[░░░░░░░░░░░░░░░░░░░░]  Unknown".to_string(),
+    };
+    rows.push(usage_field_row(
+        "Context Window",
+        &context,
+        card_width,
+        theme,
+    ));
+    rows.push(usage_row(
+        Line::styled(
+            format!("╰{horizontal}╯"),
+            Style::default().fg(theme.gray_dim),
+        ),
+        theme,
+    ));
+}
+
+fn usage_field_row(label: &str, value: &str, width: usize, theme: &Theme) -> TranscriptRow {
+    let prefix = format!("│  {label:<16} ");
+    let available = width.saturating_sub(prefix.width() + 2);
+    let value = truncate(value, available);
+    let gap = available.saturating_sub(value.width());
+    usage_row(
+        Line::from(vec![
+            Span::styled("│  ", Style::default().fg(theme.gray_dim)),
+            Span::styled(
+                format!("{label:<16} "),
+                Style::default().fg(theme.text_secondary),
+            ),
+            Span::styled(value, Style::default().fg(theme.text_primary)),
+            Span::raw(" ".repeat(gap)),
+            Span::styled("│", Style::default().fg(theme.gray_dim)),
+        ]),
+        theme,
+    )
+}
+
+fn usage_row(line: Line<'static>, theme: &Theme) -> TranscriptRow {
+    TranscriptRow {
+        line,
+        background: theme.bg_base,
+        fold_entry: None,
+    }
+}
+
+fn context_progress_bar(percent_left: u64) -> String {
+    let filled = ((percent_left.min(100) * 20 + 50) / 100) as usize;
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(20 - filled))
+}
+
+fn format_tokens(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
     }
 }
 
@@ -1264,11 +1510,21 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
         }
     }
 
-    let input_hint = if app.multiline_mode {
+    let multiline_hint = if app.multiline_mode {
         " · multiline · Ctrl+Enter"
     } else {
         ""
     };
+    let vim_hint = if app.vim_mode {
+        if app.vim_insert_mode {
+            " · VIM INSERT"
+        } else {
+            " · VIM NORMAL"
+        }
+    } else {
+        ""
+    };
+    let input_hint = format!("{multiline_hint}{vim_hint}");
     let info = app.active_model().map_or_else(
         || format!(" indus · {}{} ", app.theme_kind.name(), input_hint),
         |active| {
@@ -2573,6 +2829,41 @@ mod tests {
         build_transcript_rows(&mut rows, 0, &entry, 80, &theme);
         assert_eq!(plain_line(&rows[0].line), "● Edit src/main.rs +1/-1");
         assert_eq!(rows[0].line.spans[0].style.fg, Some(theme.accent_success));
+    }
+
+    #[test]
+    fn usage_card_contains_only_requested_status_fields_and_context_bar() {
+        let theme = Theme::for_preference(crate::theme::ThemeKind::IndusNight);
+        let card = UsageCard {
+            model: "Model One · Provider".into(),
+            directory: "/workspace".into(),
+            permissions: "Plan · read-only".into(),
+            session: "ses-i_example".into(),
+            context_used: 25_000,
+            context_window: Some(100_000),
+        };
+        let mut rows = Vec::new();
+        render_usage_card(&mut rows, &card, 96, &theme);
+        let rendered = rows
+            .iter()
+            .map(|row| plain_line(&row.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for label in [
+            "Indus",
+            "Model",
+            "Directory",
+            "Permissions",
+            "Session",
+            "Context Window",
+        ] {
+            assert!(rendered.contains(label), "missing {label}: {rendered}");
+        }
+        assert!(rendered.contains("75% left"));
+        assert!(rendered.contains("25.0K used / 100.0K"));
+        assert!(rendered.contains("███████████████░░░░░"));
+        assert!(!rendered.contains("Visit"));
+        assert!(!rendered.contains(">_"));
     }
 
     fn plain_line(line: &Line<'_>) -> String {
