@@ -4,6 +4,7 @@ use crate::theme::ThemeKind;
 pub enum ArgumentSource {
     None,
     Theme,
+    Effort,
     Values(&'static [ArgumentValue]),
 }
 
@@ -80,21 +81,6 @@ const TOGGLE_VALUES: &[ArgumentValue] = &[
     },
 ];
 
-const EFFORT_VALUES: &[ArgumentValue] = &[
-    ArgumentValue {
-        value: "low",
-        description: "Faster, lighter reasoning",
-    },
-    ArgumentValue {
-        value: "medium",
-        description: "Balanced reasoning",
-    },
-    ArgumentValue {
-        value: "high",
-        description: "Deeper reasoning",
-    },
-];
-
 pub static COMMANDS: &[SlashCommand] = &[
     SlashCommand::plain("quit", "Quit Indus", "/quit"),
     SlashCommand::plain("help", "Show available commands", "/help"),
@@ -125,7 +111,7 @@ pub static COMMANDS: &[SlashCommand] = &[
         "/effort <level>",
         "<level>",
         true,
-        ArgumentSource::Values(EFFORT_VALUES),
+        ArgumentSource::Effort,
     ),
     SlashCommand::with_args(
         "always-approve",
@@ -143,7 +129,6 @@ pub static COMMANDS: &[SlashCommand] = &[
         false,
         ArgumentSource::Values(TOGGLE_VALUES),
     ),
-    SlashCommand::plain("compact-mode", "Toggle compact UI mode", "/compact-mode"),
     SlashCommand::with_args(
         "vim-mode",
         "Configure Vim keybindings",
@@ -159,14 +144,6 @@ pub static COMMANDS: &[SlashCommand] = &[
         "Rename the current session",
         "/rename <name>",
         "<name>",
-        true,
-        ArgumentSource::None,
-    ),
-    SlashCommand::with_args(
-        "cd",
-        "Change working directory",
-        "/cd <path>",
-        "<path>",
         true,
         ArgumentSource::None,
     ),
@@ -199,9 +176,9 @@ pub static COMMANDS: &[SlashCommand] = &[
     SlashCommand::plain("workflows", "View saved workflows", "/workflows"),
     SlashCommand::with_args(
         "btw",
-        "Add a side note to the agent",
-        "/btw <note>",
-        "<note>",
+        "Ask a side question without interrupting",
+        "/btw <question>",
+        "<question>",
         true,
         ArgumentSource::None,
     ),
@@ -281,7 +258,13 @@ impl Default for SlashMenu {
 }
 
 impl SlashMenu {
-    pub fn refresh(&mut self, input: &str, cursor: usize, active_theme: ThemeKind) {
+    pub fn refresh(
+        &mut self,
+        input: &str,
+        cursor: usize,
+        active_theme: ThemeKind,
+        effort_values: &[String],
+    ) {
         let previous_insert = self.selection().map(|row| row.insert_text.clone());
         let Some(parsed) = ParsedSlash::from_input(input, cursor) else {
             *self = Self::default();
@@ -302,6 +285,7 @@ impl SlashMenu {
                 COMMANDS[command_index],
                 &input[argument_range.start..cursor.min(argument_range.end)],
                 active_theme,
+                effort_values,
             );
         } else {
             self.phase = CompletionPhase::Command;
@@ -410,6 +394,7 @@ fn argument_suggestions(
     command: SlashCommand,
     query: &str,
     active_theme: ThemeKind,
+    effort_values: &[String],
 ) -> Vec<Suggestion> {
     let values = match command.argument_source {
         ArgumentSource::None => return Vec::new(),
@@ -436,6 +421,24 @@ fn argument_suggestions(
                 .collect::<Vec<_>>()
                 .pipe(sort_suggestions);
         }
+        ArgumentSource::Effort => {
+            return effort_values
+                .iter()
+                .filter_map(|value| {
+                    let (score, matched_indices) = fuzzy_match(query.trim(), value)?;
+                    Some((
+                        score,
+                        Suggestion {
+                            display: value.clone(),
+                            description: effort_description(value).to_string(),
+                            insert_text: value.clone(),
+                            matched_indices,
+                        },
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .pipe(sort_suggestions);
+        }
         ArgumentSource::Values(values) => values,
     };
 
@@ -455,6 +458,20 @@ fn argument_suggestions(
         })
         .collect::<Vec<_>>()
         .pipe(sort_suggestions)
+}
+
+fn effort_description(value: &str) -> &'static str {
+    match value {
+        "none" => "Disable model reasoning",
+        "minimal" => "Minimal reasoning",
+        "low" => "Faster, lighter reasoning",
+        "medium" => "Balanced reasoning",
+        "high" => "Deeper reasoning",
+        "xhigh" => "Extended reasoning",
+        "max" => "Maximum model reasoning",
+        "ultra" => "Provider-defined ultra reasoning",
+        _ => "Provider-supported reasoning effort",
+    }
 }
 
 fn sort_suggestions(mut rows: Vec<(i32, Suggestion)>) -> Vec<Suggestion> {
@@ -536,7 +553,7 @@ mod tests {
     #[test]
     fn theme_command_changes_to_argument_suggestions() {
         let mut menu = SlashMenu::default();
-        menu.refresh("/theme ", 7, ThemeKind::IndusNight);
+        menu.refresh("/theme ", 7, ThemeKind::IndusNight, &[]);
         assert!(matches!(
             menu.phase,
             CompletionPhase::Arguments { command_index }
@@ -567,5 +584,21 @@ mod tests {
         assert!(!names.contains(&"personas"));
         assert!(!names.contains(&"dashboard"));
         assert!(names.contains(&"compact"));
+        assert!(!names.contains(&"compact-mode"));
+        assert!(!names.contains(&"cd"));
+    }
+
+    #[test]
+    fn effort_suggestions_use_only_selected_model_capabilities() {
+        let mut menu = SlashMenu::default();
+        let efforts = vec!["low".to_string(), "max".to_string()];
+        menu.refresh("/effort ", 8, ThemeKind::IndusNight, &efforts);
+        assert_eq!(
+            menu.suggestions
+                .iter()
+                .map(|row| row.display.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "max"]
+        );
     }
 }
