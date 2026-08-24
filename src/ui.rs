@@ -13,8 +13,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        App, BrowserPanel, BtwPanel, CatalogModal, HOME_MENU, HitZones, ModelCatalogView,
-        ToolVisualState, TranscriptEntry, TurnActivity, UsageCard,
+        App, BtwPanel, CatalogModal, HOME_MENU, HitZones, ModelCatalogView, ToolVisualState,
+        TranscriptEntry, TurnActivity, UsageCard,
     },
     features::BrowserAction,
     harness::event::{DiffKind, FileDiff},
@@ -100,8 +100,8 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(panel) = app.resume_panel.as_ref() {
         render_resume_panel(frame, panel, &theme, &mut zones);
     }
-    if let Some(panel) = app.browser_panel.as_ref() {
-        render_browser_panel(frame, panel, &theme, &mut zones);
+    if app.browser_panel.is_some() {
+        render_browser_panel(frame, app, &theme, &mut zones);
     }
     if let Some(confirmation) = app.delete_confirmation.as_ref() {
         render_delete_confirmation(frame, area, confirmation, &theme);
@@ -422,12 +422,10 @@ fn render_resume_panel(
     ));
 }
 
-fn render_browser_panel(
-    frame: &mut Frame<'_>,
-    state: &BrowserPanel,
-    theme: &Theme,
-    zones: &mut HitZones,
-) {
+fn render_browser_panel(frame: &mut Frame<'_>, app: &mut App, theme: &Theme, zones: &mut HitZones) {
+    let Some(state) = app.browser_panel.clone() else {
+        return;
+    };
     let width = frame.area().width.saturating_sub(4).clamp(52, 96);
     let height = frame.area().height.saturating_sub(4).clamp(12, 28);
     let panel = centered_rect(frame.area(), width.min(frame.area().width), height);
@@ -481,9 +479,10 @@ fn render_browser_panel(
                 }
             })
             .collect::<Vec<_>>();
+        let start = app.sync_browser_viewport(content, lines.clone());
         for (offset, line) in lines
             .iter()
-            .skip(detail.scroll.min(lines.len().saturating_sub(1)))
+            .skip(start)
             .take(content.height as usize)
             .enumerate()
         {
@@ -499,6 +498,7 @@ fn render_browser_panel(
                 Rect::new(content.x, content.y + offset as u16, content.width, 1),
             );
         }
+        render_browser_text_selection(frame.buffer_mut(), content, app, start);
     } else if state.items.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -565,6 +565,26 @@ fn render_browser_panel(
         Paragraph::new(Line::styled(footer_text, Style::default().fg(theme.gray))),
         Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
     );
+}
+
+fn render_browser_text_selection(buffer: &mut Buffer, area: Rect, app: &App, start: usize) {
+    let selection_style = Style::default().add_modifier(Modifier::REVERSED);
+    for viewport_row in 0..area.height as usize {
+        let Some((selection_start, selection_end)) =
+            app.browser_selection_display_range(start + viewport_row)
+        else {
+            continue;
+        };
+        let first = selection_start.min(area.width as usize);
+        let last = selection_end.min(area.width as usize);
+        for column in first..last {
+            if let Some(cell) =
+                buffer.cell_mut((area.x + column as u16, area.y + viewport_row as u16))
+            {
+                cell.set_style(selection_style);
+            }
+        }
+    }
 }
 
 fn relative_time(timestamp: i64) -> String {
@@ -1090,7 +1110,7 @@ fn render_usage_card(rows: &mut Vec<TranscriptRow>, card: &UsageCard, width: usi
     let horizontal = "─".repeat(card_width.saturating_sub(2));
     rows.push(usage_row(
         Line::from(vec![
-            Span::styled("╭─ ", Style::default().fg(theme.gray_dim)),
+            Span::styled("┌─ ", Style::default().fg(theme.gray_dim)),
             Span::styled(
                 "Indus",
                 Style::default()
@@ -1098,7 +1118,7 @@ fn render_usage_card(rows: &mut Vec<TranscriptRow>, card: &UsageCard, width: usi
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(" {}╮", "─".repeat(card_width.saturating_sub(10))),
+                format!(" {}┐", "─".repeat(card_width.saturating_sub(10))),
                 Style::default().fg(theme.gray_dim),
             ),
         ]),
@@ -1134,7 +1154,7 @@ fn render_usage_card(rows: &mut Vec<TranscriptRow>, card: &UsageCard, width: usi
     ));
     rows.push(usage_row(
         Line::styled(
-            format!("╰{horizontal}╯"),
+            format!("└{horizontal}┘"),
             Style::default().fg(theme.gray_dim),
         ),
         theme,
@@ -2761,22 +2781,20 @@ mod tests {
     }
 
     #[test]
-    fn streamed_thinking_shows_its_body_until_completion() {
+    fn streamed_thinking_stays_collapsed_by_default() {
         let theme = Theme::for_preference(crate::theme::ThemeKind::IndusNight);
         let entry = TranscriptEntry::Thinking {
             id: "r1".into(),
             text: "Inspecting the workspace".into(),
             running: true,
             elapsed_ms: None,
-            expanded: true,
+            expanded: false,
         };
         let mut rows = Vec::new();
         build_transcript_rows(&mut rows, 0, &entry, 80, &theme);
         assert_eq!(plain_line(&rows[0].line), "● Thinking…");
-        assert!(
-            rows.iter()
-                .any(|row| plain_line(&row.line).contains("Inspecting the workspace"))
-        );
+        assert_eq!(rows.len(), 1);
+        assert!(!plain_line(&rows[0].line).contains("Inspecting the workspace"));
     }
 
     #[test]
@@ -2862,6 +2880,15 @@ mod tests {
         assert!(rendered.contains("75% left"));
         assert!(rendered.contains("25.0K used / 100.0K"));
         assert!(rendered.contains("███████████████░░░░░"));
+        assert!(rendered.contains('┌'));
+        assert!(rendered.contains('┐'));
+        assert!(rendered.contains('└'));
+        assert!(rendered.contains('┘'));
+        assert!(
+            !['╭', '╮', '╰', '╯']
+                .iter()
+                .any(|corner| rendered.contains(*corner))
+        );
         assert!(!rendered.contains("Visit"));
         assert!(!rendered.contains(">_"));
     }
