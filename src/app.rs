@@ -448,6 +448,12 @@ pub struct App {
     text_selection: Option<TextSelection>,
     selection_mouse: Option<(u16, u16)>,
     selection_autoscroll: i8,
+    browser_viewport: TranscriptViewport,
+    browser_text_selection: Option<TextSelection>,
+    browser_selection_mouse: Option<(u16, u16)>,
+    browser_selection_autoscroll: i8,
+    prompt_history_cursor: Option<usize>,
+    last_history_text: Option<String>,
     pending_submission: Option<String>,
     queued_prompts: VecDeque<String>,
     pending_permission_reply: Option<(u64, PermissionReply)>,
@@ -503,6 +509,12 @@ impl App {
             text_selection: None,
             selection_mouse: None,
             selection_autoscroll: 0,
+            browser_viewport: TranscriptViewport::default(),
+            browser_text_selection: None,
+            browser_selection_mouse: None,
+            browser_selection_autoscroll: 0,
+            prompt_history_cursor: None,
+            last_history_text: None,
             pending_submission: None,
             queued_prompts: VecDeque::new(),
             pending_permission_reply: None,
@@ -681,45 +693,11 @@ impl App {
     }
 
     fn selection_point_at(&self, column: u16, row: u16, nearest: bool) -> Option<SelectionPoint> {
-        let area = self.transcript_viewport.area;
-        if area.width == 0 || area.height == 0 {
-            return None;
-        }
-        let viewport_row = if nearest {
-            row.saturating_sub(area.y)
-                .min(area.height.saturating_sub(1)) as usize
-        } else {
-            if !area.contains((column, row).into()) {
-                return None;
-            }
-            (row - area.y) as usize
-        };
-        let global_row = self.transcript_viewport.start_row + viewport_row;
-        let line = self.transcript_viewport.rows.get(global_row)?;
-        if !nearest && (line.is_empty() || column.saturating_sub(area.x) as usize >= line.width()) {
-            return None;
-        }
-        Some(SelectionPoint {
-            row: global_row,
-            byte: byte_at_display_column(line, column.saturating_sub(area.x) as usize),
-        })
+        selection_point_at_viewport(&self.transcript_viewport, column, row, nearest)
     }
 
     fn selected_text(&self, selection: TextSelection) -> String {
-        let (first, last) = ordered_selection(selection);
-        let mut output = String::new();
-        for row in first.row..=last.row {
-            let Some(line) = self.transcript_viewport.rows.get(row) else {
-                break;
-            };
-            if let Some(range) = selected_byte_range(selection, row, line) {
-                output.push_str(&line[range]);
-            }
-            if row != last.row {
-                output.push('\n');
-            }
-        }
-        output
+        selected_viewport_text(&self.transcript_viewport, selection)
     }
 
     fn reclamp_selection_head(&mut self) {
@@ -736,6 +714,167 @@ impl App {
         }
     }
 
+    pub fn sync_browser_viewport(&mut self, area: Rect, rows: Vec<String>) -> usize {
+        let maximum = rows.len().saturating_sub(area.height as usize);
+        let start = self
+            .browser_panel
+            .as_mut()
+            .and_then(|panel| panel.detail.as_mut())
+            .map(|detail| {
+                detail.scroll = detail.scroll.min(maximum);
+                detail.scroll
+            })
+            .unwrap_or(0);
+        self.browser_viewport = TranscriptViewport {
+            area,
+            rows,
+            start_row: start,
+            visible_rows: area.height as usize,
+        };
+        self.reclamp_browser_selection_head();
+        start
+    }
+
+    pub fn browser_detail_contains(&self, column: u16, row: u16) -> bool {
+        self.browser_panel
+            .as_ref()
+            .is_some_and(|panel| panel.detail.is_some())
+            && self.browser_viewport.area.contains((column, row).into())
+    }
+
+    pub fn begin_browser_text_selection(&mut self, column: u16, row: u16) -> bool {
+        let Some(point) = selection_point_at_viewport(&self.browser_viewport, column, row, false)
+        else {
+            self.browser_text_selection = None;
+            return false;
+        };
+        self.browser_text_selection = Some(TextSelection {
+            anchor: point,
+            head: point,
+            dragging: true,
+        });
+        self.browser_selection_mouse = Some((column, row));
+        self.browser_selection_autoscroll = 0;
+        true
+    }
+
+    pub fn is_selecting_browser_text(&self) -> bool {
+        self.browser_text_selection
+            .is_some_and(|selection| selection.dragging)
+    }
+
+    pub fn update_browser_text_selection(&mut self, column: u16, row: u16) -> bool {
+        if !self.is_selecting_browser_text() {
+            return false;
+        }
+        self.browser_selection_mouse = Some((column, row));
+        let area = self.browser_viewport.area;
+        self.browser_selection_autoscroll = if row <= area.y {
+            -1
+        } else if row >= area.bottom().saturating_sub(1) {
+            1
+        } else {
+            0
+        };
+        let Some(point) = selection_point_at_viewport(&self.browser_viewport, column, row, true)
+        else {
+            return true;
+        };
+        if let Some(selection) = self.browser_text_selection.as_mut() {
+            selection.head = point;
+        }
+        true
+    }
+
+    pub fn finish_browser_text_selection(&mut self) -> Option<String> {
+        self.browser_selection_autoscroll = 0;
+        self.browser_selection_mouse = None;
+        let mut selection = self.browser_text_selection?;
+        selection.dragging = false;
+        if selection.anchor == selection.head {
+            self.browser_text_selection = None;
+            return None;
+        }
+        self.browser_text_selection = Some(selection);
+        let text = selected_viewport_text(&self.browser_viewport, selection);
+        (!text.is_empty()).then_some(text)
+    }
+
+    pub fn browser_selection_display_range(&self, row: usize) -> Option<(usize, usize)> {
+        let selection = self.browser_text_selection?;
+        if selection.dragging && selection.anchor == selection.head {
+            return None;
+        }
+        let line = self.browser_viewport.rows.get(row)?;
+        let range = selected_byte_range(selection, row, line)?;
+        Some((line[..range.start].width(), line[..range.end].width()))
+    }
+
+    fn reclamp_browser_selection_head(&mut self) {
+        let Some((column, row)) = self.browser_selection_mouse else {
+            return;
+        };
+        let Some(point) = selection_point_at_viewport(&self.browser_viewport, column, row, true)
+        else {
+            return;
+        };
+        if let Some(selection) = self.browser_text_selection.as_mut()
+            && selection.dragging
+        {
+            selection.head = point;
+        }
+    }
+
+    pub fn navigate_prompt_history(&mut self, direction: isize) -> bool {
+        let prompts = self
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::User { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if prompts.is_empty() {
+            return false;
+        }
+
+        let current = self.composer.text();
+        let cursor = self.composer.cursor();
+        let can_navigate = current.is_empty()
+            || ((cursor == 0 || cursor == current.len())
+                && self.last_history_text.as_deref() == Some(current));
+        if !can_navigate {
+            return false;
+        }
+
+        let next = if direction.is_negative() {
+            match self.prompt_history_cursor {
+                None => prompts.len() - 1,
+                Some(0) => 0,
+                Some(index) => index - 1,
+            }
+        } else {
+            let Some(index) = self.prompt_history_cursor else {
+                return false;
+            };
+            if index + 1 >= prompts.len() {
+                self.prompt_history_cursor = None;
+                self.last_history_text = None;
+                self.composer.clear();
+                self.refresh_slash();
+                return true;
+            }
+            index + 1
+        };
+
+        let text = prompts[next].clone();
+        self.prompt_history_cursor = Some(next);
+        self.last_history_text = Some(text.clone());
+        self.composer.set(text);
+        self.refresh_slash();
+        true
+    }
+
     pub fn open_browser_catalog(&mut self, title: impl Into<String>, items: Vec<BrowserItem>) {
         self.close_slash();
         self.catalog_modal = None;
@@ -746,6 +885,7 @@ impl App {
             selected: 0,
             detail: None,
         });
+        self.browser_text_selection = None;
     }
 
     pub fn open_document(&mut self, title: impl Into<String>, body: impl Into<String>) {
@@ -761,6 +901,7 @@ impl App {
                 action: BrowserAction::None,
             }),
         });
+        self.browser_text_selection = None;
     }
 
     pub fn close_browser_level(&mut self) {
@@ -768,9 +909,11 @@ impl App {
             return;
         };
         if panel.detail.take().is_some() && !panel.items.is_empty() {
+            self.browser_text_selection = None;
             return;
         }
         self.browser_panel = None;
+        self.browser_text_selection = None;
     }
 
     pub fn move_browser_selection(&mut self, delta: isize) {
@@ -783,6 +926,9 @@ impl App {
             } else {
                 detail.scroll.saturating_add(delta as usize)
             };
+            self.browser_text_selection = self
+                .browser_text_selection
+                .filter(|selection| selection.dragging);
         } else if !panel.items.is_empty() {
             panel.selected =
                 (panel.selected as isize + delta).rem_euclid(panel.items.len() as isize) as usize;
@@ -1112,7 +1258,14 @@ impl App {
     }
 
     pub fn edit_composer(&mut self, edit: impl FnOnce(&mut Composer)) {
+        let before = self.composer.text().to_string();
         edit(&mut self.composer);
+        if self.composer.text() != before
+            && self.last_history_text.as_deref() != Some(self.composer.text())
+        {
+            self.prompt_history_cursor = None;
+            self.last_history_text = None;
+        }
         self.refresh_slash();
     }
 
@@ -1165,6 +1318,9 @@ impl App {
             self.close_slash();
             return;
         }
+
+        self.prompt_history_cursor = None;
+        self.last_history_text = None;
 
         if self.turn.is_some() {
             self.queued_prompts.push_back(text);
@@ -1339,6 +1495,9 @@ impl App {
         self.close_slash();
         self.resume_panel = None;
         self.browser_panel = None;
+        self.browser_text_selection = None;
+        self.prompt_history_cursor = None;
+        self.last_history_text = None;
         self.transcript_times.clear();
         self.session_id = session.is_allocated().then(|| session.id.clone());
         self.session_title = session.title.clone();
@@ -1358,7 +1517,7 @@ impl App {
                                     text: part.text.clone(),
                                     running: !part.completed,
                                     elapsed_ms: None,
-                                    expanded: !part.completed,
+                                    expanded: false,
                                 });
                             }
                             AssistantPart::Text(part) if !part.text.is_empty() => {
@@ -1542,7 +1701,7 @@ impl App {
                     text: String::new(),
                     running: true,
                     elapsed_ms: None,
-                    expanded: true,
+                    expanded: false,
                 });
                 self.thinking_entries
                     .insert(reasoning_id, (index, Instant::now()));
@@ -1860,6 +2019,11 @@ impl App {
             match self.selection_autoscroll {
                 -1 => self.scroll_transcript_up(1),
                 1 => self.scroll_transcript_down(1),
+                _ => {}
+            }
+            match self.browser_selection_autoscroll {
+                -1 => self.move_browser_selection(-1),
+                1 => self.move_browser_selection(1),
                 _ => {}
             }
         }
@@ -2249,6 +2413,53 @@ fn format_timestamp(timestamp: i64) -> String {
         seconds % 3_600 / 60,
         seconds % 60
     )
+}
+
+fn selection_point_at_viewport(
+    viewport: &TranscriptViewport,
+    column: u16,
+    row: u16,
+    nearest: bool,
+) -> Option<SelectionPoint> {
+    let area = viewport.area;
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let viewport_row = if nearest {
+        row.saturating_sub(area.y)
+            .min(area.height.saturating_sub(1)) as usize
+    } else {
+        if !area.contains((column, row).into()) {
+            return None;
+        }
+        (row - area.y) as usize
+    };
+    let global_row = viewport.start_row + viewport_row;
+    let line = viewport.rows.get(global_row)?;
+    if !nearest && (line.is_empty() || column.saturating_sub(area.x) as usize >= line.width()) {
+        return None;
+    }
+    Some(SelectionPoint {
+        row: global_row,
+        byte: byte_at_display_column(line, column.saturating_sub(area.x) as usize),
+    })
+}
+
+fn selected_viewport_text(viewport: &TranscriptViewport, selection: TextSelection) -> String {
+    let (first, last) = ordered_selection(selection);
+    let mut output = String::new();
+    for row in first.row..=last.row {
+        let Some(line) = viewport.rows.get(row) else {
+            break;
+        };
+        if let Some(range) = selected_byte_range(selection, row, line) {
+            output.push_str(&line[range]);
+        }
+        if row != last.row {
+            output.push('\n');
+        }
+    }
+    output
 }
 
 fn byte_at_display_column(line: &str, column: usize) -> usize {
@@ -2701,6 +2912,66 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn thinking_starts_collapsed_while_reasoning_streams() {
+        let mut app = App::new();
+        app.composer.set("hello");
+        app.submit();
+        app.apply_harness_event(HarnessEvent::ReasoningStarted {
+            run_id: 1,
+            reasoning_id: "r1".into(),
+        });
+        assert!(matches!(
+            &app.transcript[1],
+            TranscriptEntry::Thinking {
+                running: true,
+                expanded: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prompt_history_navigates_recent_submissions_and_clears_after_newest() {
+        let mut app = App::new();
+        app.transcript.push(TranscriptEntry::User {
+            text: "first prompt".into(),
+            slash_tokens: Vec::new(),
+        });
+        app.transcript.push(TranscriptEntry::User {
+            text: "second prompt".into(),
+            slash_tokens: Vec::new(),
+        });
+
+        assert!(app.navigate_prompt_history(-1));
+        assert_eq!(app.composer.text(), "second prompt");
+        assert!(app.navigate_prompt_history(-1));
+        assert_eq!(app.composer.text(), "first prompt");
+        assert!(app.navigate_prompt_history(1));
+        assert_eq!(app.composer.text(), "second prompt");
+        assert!(app.navigate_prompt_history(1));
+        assert!(app.composer.is_empty());
+    }
+
+    #[test]
+    fn document_selection_reconstructs_text_for_copying() {
+        let mut app = App::new();
+        app.open_document("Current plan", "first line\nsecond line");
+        app.sync_browser_viewport(
+            Rect::new(4, 6, 20, 2),
+            ["first line", "second line"].map(str::to_string).to_vec(),
+        );
+
+        assert!(app.begin_browser_text_selection(4, 6));
+        assert!(app.update_browser_text_selection(9, 7));
+        assert_eq!(
+            app.finish_browser_text_selection().as_deref(),
+            Some("first line\nsecond")
+        );
+        assert_eq!(app.browser_selection_display_range(0), Some((0, 10)));
+        assert_eq!(app.browser_selection_display_range(1), Some((0, 6)));
     }
 
     #[test]
