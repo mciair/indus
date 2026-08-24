@@ -825,9 +825,26 @@ impl Runtime {
     fn run(&self, run_id: u64, parent_id: u64) -> RunOutcome {
         self.emit(HarnessEvent::RunStarted { run_id });
 
+        // Set once compaction has run and left the transcript above the
+        // threshold, which means the preserved turns alone fill the window and
+        // retrying would only burn a model call per step.
+        let mut compaction_exhausted = false;
+
         'steps: for step in 1..=self.config.max_steps.max(1) {
             if self.cancellation.is_cancelled() {
                 return self.finish(run_id, RunOutcome::Cancelled);
+            }
+
+            // Compact before the request is built, not only after a turn
+            // settles. A resumed session, a queued prompt or a run of
+            // tool-heavy steps can all cross the threshold at a point where the
+            // previous post-turn check never sees it.
+            if !compaction_exhausted && self.should_compact() {
+                if !self.compact(run_id, None) {
+                    self.emit(HarnessEvent::CompactionRequired { run_id });
+                    return self.finish(run_id, RunOutcome::CompactionRequired);
+                }
+                compaction_exhausted = self.should_compact();
             }
 
             let (assistant, messages) = {
@@ -930,9 +947,12 @@ impl Runtime {
             if blocked {
                 return self.finish(run_id, RunOutcome::Failed);
             }
-            if self.should_compact() && !self.compact(run_id, None) {
-                self.emit(HarnessEvent::CompactionRequired { run_id });
-                return self.finish(run_id, RunOutcome::CompactionRequired);
+            if !compaction_exhausted && self.should_compact() {
+                if !self.compact(run_id, None) {
+                    self.emit(HarnessEvent::CompactionRequired { run_id });
+                    return self.finish(run_id, RunOutcome::CompactionRequired);
+                }
+                compaction_exhausted = self.should_compact();
             }
             if outcome == ProcessOutcome::Stop {
                 self.ensure_session_identity(run_id);
@@ -1142,19 +1162,29 @@ impl Runtime {
         true
     }
 
-    fn should_compact(&self) -> bool {
-        let Some(threshold) = context_compaction_threshold(
+    fn compaction_threshold(&self) -> Option<u64> {
+        context_compaction_threshold(
             self.transport.context_window(),
             self.config.compaction_threshold_percent,
-        ) else {
-            return false;
-        };
-        let context_tokens = self
-            .session
+        )
+    }
+
+    /// Occupancy of the next request, measured the same way the status card
+    /// reports it so the displayed percentage and the compaction trigger can
+    /// never disagree.
+    fn context_occupancy(&self) -> u64 {
+        self.session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .current_context_tokens();
-        context_tokens > 0 && context_tokens >= threshold
+            .current_context_tokens()
+    }
+
+    fn should_compact(&self) -> bool {
+        let Some(threshold) = self.compaction_threshold() else {
+            return false;
+        };
+        let occupancy = self.context_occupancy();
+        occupancy > 0 && occupancy >= threshold
     }
 
     fn wait_or_cancel(&self, milliseconds: u64) -> Result<(), TransportError> {
