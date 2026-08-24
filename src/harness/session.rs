@@ -14,6 +14,18 @@ pub struct UserMessage {
     pub text: String,
 }
 
+/// Marks the synthetic user turn that carries a compaction summary back to the
+/// model. Nothing outside the harness should treat it as a real prompt.
+const CONTEXT_SUMMARY_PREFIX: &str = "[Conversation summary]\n";
+
+impl UserMessage {
+    /// True when this turn is compaction context the harness wrote rather than
+    /// something the user typed.
+    pub fn is_context_summary(&self) -> bool {
+        is_summary(&self.text)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReasoningPart {
     pub id: String,
@@ -404,7 +416,7 @@ impl Session {
                 .find_map(|message| match message {
                     SessionMessage::User(user) => user
                         .text
-                        .strip_prefix("[Conversation summary]\n")
+                        .strip_prefix(CONTEXT_SUMMARY_PREFIX)
                         .map(str::trim)
                         .filter(|summary| !summary.is_empty())
                         .map(str::to_string),
@@ -446,7 +458,7 @@ impl Session {
         let id = self.allocate_message_id();
         self.messages.push(SessionMessage::User(UserMessage {
             id,
-            text: format!("[Conversation summary]\n{}", summary.into().trim()),
+            text: format!("{CONTEXT_SUMMARY_PREFIX}{}", summary.into().trim()),
         }));
         self.messages.extend(preserved);
         self.touch();
@@ -478,7 +490,7 @@ pub fn title_from_first_prompt(prompt: &str) -> Option<String> {
 }
 
 fn is_summary(text: &str) -> bool {
-    text.starts_with("[Conversation summary]\n")
+    text.starts_with(CONTEXT_SUMMARY_PREFIX)
 }
 
 /// Average characters per token across the transcripts these providers bill.
@@ -640,6 +652,40 @@ mod tests {
         assert!(
             projected >= 81_000,
             "the pending prompt has to raise occupancy, got {projected}"
+        );
+    }
+
+    #[test]
+    fn the_summary_turn_is_identifiable_as_harness_context() {
+        let mut session = Session::default();
+        let user = session.push_user("a prompt the user typed");
+        let mut assistant = session.next_assistant(user);
+        assistant.parts.push(AssistantPart::Text(TextPart {
+            id: "text-1".into(),
+            text: "an answer".into(),
+            completed: true,
+        }));
+        session.push_assistant(assistant);
+        let input = session.compaction_input(2, 90_000).unwrap();
+        session.compact_at("condensed", input.preserve_from);
+
+        let summaries = session
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                SessionMessage::User(user) => Some(user),
+                SessionMessage::Assistant(_) => None,
+            })
+            .filter(|user| user.is_context_summary())
+            .count();
+        assert_eq!(summaries, 1, "compaction writes exactly one summary turn");
+        assert!(
+            !UserMessage {
+                id: 1,
+                text: "a prompt the user typed".into(),
+            }
+            .is_context_summary(),
+            "a real prompt must never be mistaken for harness context"
         );
     }
 
