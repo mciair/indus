@@ -436,7 +436,7 @@ fn fetch_openai_models(
             .bearer_auth(api_key),
         provider,
     )?;
-    parse_openai_list(&value, false)
+    parse_openai_list(&value, provider, false)
 }
 
 fn fetch_groq_models(
@@ -450,11 +450,12 @@ fn fetch_groq_models(
             .bearer_auth(api_key),
         provider,
     )?;
-    parse_openai_list(&value, true)
+    parse_openai_list(&value, provider, true)
 }
 
 fn parse_openai_list(
     value: &Value,
+    provider: ProviderId,
     honor_active: bool,
 ) -> Result<Vec<ModelRecord>, DiscoveryError> {
     let data = value
@@ -474,7 +475,6 @@ fn parse_openai_list(
             let id = entry.get("id")?.as_str()?.to_string();
             Some(ModelRecord {
                 name: id.clone(),
-                id,
                 description: entry
                     .get("owned_by")
                     .and_then(Value::as_str)
@@ -482,8 +482,9 @@ fn parse_openai_list(
                     .unwrap_or_default(),
                 context_window: entry.get("context_window").and_then(Value::as_u64),
                 supports_tools: None,
-                reasoning_efforts: exposed_reasoning_efforts(entry),
-                default_reasoning_effort: exposed_default_effort(entry),
+                reasoning_efforts: reasoning_efforts(provider, entry, &id),
+                default_reasoning_effort: reasoning_default(provider, entry, &id),
+                id,
             })
         })
         .collect())
@@ -518,12 +519,12 @@ fn fetch_anthropic_models(
                     .and_then(Value::as_str)
                     .unwrap_or(&id)
                     .to_string(),
-                id,
                 description: String::new(),
                 context_window: entry.get("max_input_tokens").and_then(Value::as_u64),
                 supports_tools: Some(true),
-                reasoning_efforts: exposed_reasoning_efforts(entry),
-                default_reasoning_effort: exposed_default_effort(entry),
+                reasoning_efforts: reasoning_efforts(provider, entry, &id),
+                default_reasoning_effort: reasoning_default(provider, entry, &id),
+                id,
             })
         }));
         if !value
@@ -583,7 +584,6 @@ fn fetch_gemini_models(
                     .and_then(Value::as_str)
                     .unwrap_or(&id)
                     .to_string(),
-                id,
                 description: entry
                     .get("description")
                     .and_then(Value::as_str)
@@ -591,8 +591,9 @@ fn fetch_gemini_models(
                     .to_string(),
                 context_window: entry.get("inputTokenLimit").and_then(Value::as_u64),
                 supports_tools: None,
-                reasoning_efforts: exposed_reasoning_efforts(entry),
-                default_reasoning_effort: exposed_default_effort(entry),
+                reasoning_efforts: reasoning_efforts(provider, entry, &id),
+                default_reasoning_effort: reasoning_default(provider, entry, &id),
+                id,
             })
         }));
         page_token = value
@@ -650,7 +651,6 @@ fn fetch_openrouter_models(
                     .and_then(Value::as_str)
                     .unwrap_or(&id)
                     .to_string(),
-                id,
                 description: entry
                     .get("description")
                     .and_then(Value::as_str)
@@ -658,11 +658,212 @@ fn fetch_openrouter_models(
                     .to_string(),
                 context_window: entry.get("context_length").and_then(Value::as_u64),
                 supports_tools,
-                reasoning_efforts: exposed_reasoning_efforts(entry),
-                default_reasoning_effort: exposed_default_effort(entry),
+                reasoning_efforts: reasoning_efforts(provider, entry, &id),
+                default_reasoning_effort: reasoning_default(provider, entry, &id),
+                id,
             })
         })
         .collect())
+}
+
+/// Every reasoning effort Indus can offer, cheapest first. Providers expose
+/// overlapping subsets of this ladder under different parameter names.
+pub const REASONING_EFFORTS: [&str; 8] = [
+    "none", "minimal", "default", "low", "medium", "high", "xhigh", "max",
+];
+
+/// Reasoning effort levels a model accepts.
+///
+/// Model listings do not describe reasoning capability: OpenAI, Anthropic and
+/// Gemini all return little more than bare identifiers, and OpenRouter only
+/// reports whether a `reasoning` parameter exists at all. The ladder therefore
+/// has to be derived from the model family, with any metadata a provider does
+/// publish taking precedence over the derivation.
+fn reasoning_efforts(provider: ProviderId, entry: &Value, id: &str) -> Vec<String> {
+    let declared = exposed_reasoning_efforts(entry);
+    if !declared.is_empty() {
+        return declared;
+    }
+    let id = id.to_ascii_lowercase();
+    match provider {
+        ProviderId::OpenAi => openai_efforts(&id),
+        ProviderId::Anthropic => anthropic_efforts(&id),
+        ProviderId::Gemini => gemini_efforts(&id),
+        ProviderId::Groq => groq_efforts(&id),
+        ProviderId::OpenRouter => openrouter_efforts(entry, &id),
+    }
+}
+
+fn reasoning_default(provider: ProviderId, entry: &Value, id: &str) -> Option<String> {
+    if let Some(declared) = exposed_default_effort(entry) {
+        return Some(declared);
+    }
+    let supported = reasoning_efforts(provider, entry, id);
+    if supported.is_empty() {
+        return None;
+    }
+    let documented = match provider {
+        // Anthropic's effort parameter behaves as `high` when omitted.
+        ProviderId::Anthropic => "high",
+        // Gemini's thinking level defaults to the top of each model's ladder.
+        ProviderId::Gemini => "high",
+        ProviderId::OpenAi | ProviderId::Groq | ProviderId::OpenRouter => "medium",
+    };
+    supported
+        .iter()
+        .find(|value| *value == documented)
+        .or_else(|| supported.last())
+        .cloned()
+}
+
+/// OpenAI accepts `reasoning_effort` only on its reasoning families. GPT-5.1
+/// replaced `minimal` with `none`, and the Codex Max line adds `xhigh`.
+fn openai_efforts(id: &str) -> Vec<String> {
+    if let Some((major, minor)) = family_version(id, "gpt-") {
+        if major < 5 {
+            return Vec::new();
+        }
+        let mut ladder = vec![if (major, minor) >= (5, 1) {
+            "none"
+        } else {
+            "minimal"
+        }];
+        ladder.extend(["low", "medium", "high"]);
+        if id.contains("codex-max") {
+            ladder.push("xhigh");
+        }
+        return owned(&ladder);
+    }
+    if is_openai_o_series(id) {
+        return owned(&["low", "medium", "high"]);
+    }
+    Vec::new()
+}
+
+/// Anthropic exposes `output_config.effort` from Claude Opus 4.5 and Sonnet 4.6
+/// onwards. `max` arrived with the 4.6 generation and `xhigh` with 4.7.
+fn anthropic_efforts(id: &str) -> Vec<String> {
+    let Some((major, minor)) = family_version(id, "claude-") else {
+        return Vec::new();
+    };
+    if !["opus", "sonnet", "fable", "mythos"]
+        .iter()
+        .any(|family| id.contains(family))
+    {
+        return Vec::new();
+    }
+    let eligible = match (major, minor) {
+        // Opus 4.5 was the first model to take the parameter; its Sonnet and
+        // Haiku siblings of the same generation did not.
+        (4, 5) => id.contains("opus"),
+        (4, minor) => minor >= 6,
+        (major, _) => major >= 5,
+    };
+    if !eligible {
+        return Vec::new();
+    }
+    let mut ladder = vec!["low", "medium", "high"];
+    if (major, minor) >= (4, 7) {
+        ladder.push("xhigh");
+    }
+    if (major, minor) >= (4, 6) {
+        ladder.push("max");
+    }
+    owned(&ladder)
+}
+
+/// Gemini maps effort onto `thinkingConfig.thinkingLevel`. The 2.5 generation
+/// covers low through high; the lighter Gemini 3 models add `minimal`.
+fn gemini_efforts(id: &str) -> Vec<String> {
+    let Some((major, minor)) = family_version(id, "gemini-") else {
+        return Vec::new();
+    };
+    if (major, minor) < (2, 5) {
+        return Vec::new();
+    }
+    let lightweight = id.contains("flash") || id.contains("lite");
+    if major >= 3 && lightweight {
+        return owned(&["minimal", "low", "medium", "high"]);
+    }
+    owned(&["low", "medium", "high"])
+}
+
+/// Groq splits the parameter in two: the GPT-OSS models take the usual ladder,
+/// while its other reasoning models only accept `none` or `default`.
+fn groq_efforts(id: &str) -> Vec<String> {
+    if id.contains("gpt-oss") {
+        return owned(&["low", "medium", "high"]);
+    }
+    if ["qwen", "deepseek-r1", "qwq", "thinking"]
+        .iter()
+        .any(|family| id.contains(family))
+    {
+        return owned(&["none", "default"]);
+    }
+    Vec::new()
+}
+
+/// OpenRouter reports reasoning support through `supported_parameters` but never
+/// enumerates the levels, so the upstream family decides the ladder.
+fn openrouter_efforts(entry: &Value, id: &str) -> Vec<String> {
+    let supported = entry
+        .get("supported_parameters")
+        .and_then(Value::as_array)
+        .is_some_and(|parameters| {
+            parameters.iter().any(|parameter| {
+                matches!(
+                    parameter.as_str(),
+                    Some("reasoning" | "reasoning_effort" | "include_reasoning")
+                )
+            })
+        });
+    if !supported {
+        return Vec::new();
+    }
+    let upstream = match id.split_once('/') {
+        Some(("openai", _)) => openai_efforts(id),
+        Some(("anthropic", _)) => anthropic_efforts(id),
+        Some(("google", _)) => gemini_efforts(id),
+        Some(_) | None => Vec::new(),
+    };
+    if !upstream.is_empty() {
+        return upstream;
+    }
+    owned(&["low", "medium", "high"])
+}
+
+fn is_openai_o_series(id: &str) -> bool {
+    let family = id.rsplit('/').next().unwrap_or(id);
+    ["o1", "o3", "o4"]
+        .iter()
+        .any(|series| family == *series || family.starts_with(&format!("{series}-")))
+}
+
+/// Reads the `major.minor` version that follows `family` in a model id.
+/// The version does not always sit directly behind the family name and
+/// providers separate the parts with either a dot or a dash, so
+/// `gpt-5.1-codex-max` and `claude-opus-4-5-20251101` both parse.
+fn family_version(id: &str, family: &str) -> Option<(u32, u32)> {
+    let start = id.find(family)? + family.len();
+    let rest = &id[start..];
+    let digits = rest.find(|character: char| character.is_ascii_digit())?;
+    let version = rest[digits..]
+        .split(|character: char| !character.is_ascii_digit() && !"-.".contains(character))
+        .next()?;
+    let mut parts = version.split(['.', '-']);
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts
+        .next()
+        // Anthropic appends a release date, so a long run of digits is a build
+        // stamp rather than a minor version.
+        .filter(|value| value.len() <= 2)
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    Some((major, minor))
+}
+
+fn owned(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
 }
 
 fn exposed_reasoning_efforts(entry: &Value) -> Vec<String> {
@@ -675,17 +876,14 @@ fn exposed_reasoning_efforts(entry: &Value) -> Vec<String> {
     let Some(values) = values else {
         return Vec::new();
     };
-    let allowed = [
-        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
-    ];
-    let mut output = values
+    let mut seen = HashSet::new();
+    values
         .iter()
         .filter_map(Value::as_str)
         .map(|value| value.to_ascii_lowercase())
-        .filter(|value| allowed.contains(&value.as_str()))
-        .collect::<Vec<_>>();
-    output.dedup();
-    output
+        .filter(|value| REASONING_EFFORTS.contains(&value.as_str()))
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
 }
 
 fn exposed_default_effort(entry: &Value) -> Option<String> {
@@ -694,6 +892,7 @@ fn exposed_default_effort(entry: &Value) -> Option<String> {
         .or_else(|| entry.get("default_reasoning_effort"))
         .and_then(Value::as_str)
         .map(|value| value.to_ascii_lowercase())
+        .filter(|value| REASONING_EFFORTS.contains(&value.as_str()))
 }
 
 fn get_json(
@@ -789,7 +988,7 @@ mod tests {
                 {"id": "gpt-image-1", "owned_by": "openai"}
             ]
         });
-        let models = parse_openai_list(&value, false).unwrap();
+        let models = parse_openai_list(&value, ProviderId::OpenAi, false).unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "gpt-5");
     }
@@ -806,9 +1005,128 @@ mod tests {
                 }
             }]
         });
-        let models = parse_openai_list(&value, false).unwrap();
+        let models = parse_openai_list(&value, ProviderId::OpenAi, false).unwrap();
         assert_eq!(models[0].reasoning_efforts, ["max", "high", "low"]);
         assert_eq!(models[0].default_reasoning_effort.as_deref(), Some("high"));
+    }
+
+    fn efforts_for(provider: ProviderId, id: &str) -> Vec<String> {
+        reasoning_efforts(provider, &Value::Null, id)
+    }
+
+    #[test]
+    fn openai_reasoning_families_get_their_documented_ladders() {
+        assert_eq!(
+            efforts_for(ProviderId::OpenAi, "gpt-5"),
+            ["minimal", "low", "medium", "high"]
+        );
+        assert_eq!(
+            efforts_for(ProviderId::OpenAi, "gpt-5-mini"),
+            ["minimal", "low", "medium", "high"]
+        );
+        // GPT-5.1 traded `minimal` for `none`, and Codex Max added `xhigh`.
+        assert_eq!(
+            efforts_for(ProviderId::OpenAi, "gpt-5.1"),
+            ["none", "low", "medium", "high"]
+        );
+        assert_eq!(
+            efforts_for(ProviderId::OpenAi, "gpt-5.1-codex-max"),
+            ["none", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
+            efforts_for(ProviderId::OpenAi, "o3-mini"),
+            ["low", "medium", "high"]
+        );
+        assert!(efforts_for(ProviderId::OpenAi, "gpt-4o").is_empty());
+        assert!(efforts_for(ProviderId::OpenAi, "chatgpt-4o-latest").is_empty());
+    }
+
+    #[test]
+    fn anthropic_effort_starts_at_the_generation_that_accepts_it() {
+        assert!(efforts_for(ProviderId::Anthropic, "claude-3-7-sonnet-20250219").is_empty());
+        assert!(efforts_for(ProviderId::Anthropic, "claude-sonnet-4-20250514").is_empty());
+        assert_eq!(
+            efforts_for(ProviderId::Anthropic, "claude-opus-4-5-20251101"),
+            ["low", "medium", "high"]
+        );
+        assert_eq!(
+            efforts_for(ProviderId::Anthropic, "claude-sonnet-4-6"),
+            ["low", "medium", "high", "max"]
+        );
+        assert_eq!(
+            efforts_for(ProviderId::Anthropic, "claude-opus-4-7"),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+    }
+
+    #[test]
+    fn gemini_thinking_models_expose_levels_and_older_ones_do_not() {
+        assert!(efforts_for(ProviderId::Gemini, "gemini-2.0-flash").is_empty());
+        assert_eq!(
+            efforts_for(ProviderId::Gemini, "gemini-2.5-pro"),
+            ["low", "medium", "high"]
+        );
+        assert_eq!(
+            efforts_for(ProviderId::Gemini, "gemini-3-flash-preview"),
+            ["minimal", "low", "medium", "high"]
+        );
+    }
+
+    #[test]
+    fn groq_separates_the_gpt_oss_ladder_from_its_toggle_models() {
+        assert_eq!(
+            efforts_for(ProviderId::Groq, "openai/gpt-oss-120b"),
+            ["low", "medium", "high"]
+        );
+        assert_eq!(
+            efforts_for(ProviderId::Groq, "qwen/qwen3-32b"),
+            ["none", "default"]
+        );
+        assert!(efforts_for(ProviderId::Groq, "llama-3.3-70b-versatile").is_empty());
+    }
+
+    #[test]
+    fn openrouter_requires_declared_reasoning_support_then_follows_the_upstream_family() {
+        let without = serde_json::json!({ "supported_parameters": ["tools"] });
+        assert!(reasoning_efforts(ProviderId::OpenRouter, &without, "openai/gpt-5.1").is_empty());
+
+        let with = serde_json::json!({ "supported_parameters": ["tools", "reasoning"] });
+        assert_eq!(
+            reasoning_efforts(ProviderId::OpenRouter, &with, "openai/gpt-5.1"),
+            ["none", "low", "medium", "high"]
+        );
+        assert_eq!(
+            reasoning_efforts(ProviderId::OpenRouter, &with, "anthropic/claude-opus-4.7"),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        // An unrecognised vendor still gets the ladder every OpenRouter
+        // reasoning model accepts rather than nothing at all.
+        assert_eq!(
+            reasoning_efforts(ProviderId::OpenRouter, &with, "z-ai/glm-4.6"),
+            ["low", "medium", "high"]
+        );
+    }
+
+    #[test]
+    fn derived_defaults_stay_inside_the_derived_ladder() {
+        for (provider, id) in [
+            (ProviderId::OpenAi, "gpt-5.1"),
+            (ProviderId::Anthropic, "claude-opus-4-7"),
+            (ProviderId::Gemini, "gemini-2.5-pro"),
+            (ProviderId::Groq, "openai/gpt-oss-120b"),
+        ] {
+            let supported = efforts_for(provider, id);
+            let default = reasoning_default(provider, &Value::Null, id)
+                .unwrap_or_else(|| panic!("{id} should carry a default effort"));
+            assert!(
+                supported.contains(&default),
+                "{id} defaulted to {default}, which is outside {supported:?}"
+            );
+        }
+        assert_eq!(
+            reasoning_default(ProviderId::OpenAi, &Value::Null, "gpt-4o"),
+            None
+        );
     }
 
     #[test]
