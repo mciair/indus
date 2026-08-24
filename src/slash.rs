@@ -215,7 +215,6 @@ pub static COMMANDS: &[SlashCommand] = &[
     SlashCommand::plain("queue", "Show queued prompts", "/queue"),
     SlashCommand::plain("tasks", "Show background tasks", "/tasks"),
     SlashCommand::plain("release-notes", "Show release notes", "/release-notes"),
-    SlashCommand::plain("tutorial", "Open the interactive tutorial", "/tutorial"),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -545,6 +544,7 @@ mod tests {
             "jump",
             "config-agents",
             "loop",
+            "tutorial",
         ] {
             assert!(COMMANDS.iter().all(|command| command.name != name));
         }
