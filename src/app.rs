@@ -1504,6 +1504,10 @@ impl App {
         self.queued_prompts.clear();
         for message in &session.messages {
             match message {
+                // The compaction summary is context written for the model, not
+                // a turn the user typed. Replaying it would show synthetic text
+                // in the transcript and offer it back through prompt recall.
+                SessionMessage::User(message) if message.is_context_summary() => {}
                 SessionMessage::User(message) => self.transcript.push(TranscriptEntry::User {
                     text: message.text.clone(),
                     slash_tokens: recognized_slash_tokens(&message.text),
@@ -2931,6 +2935,65 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_restored_session_hides_the_compaction_summary_from_view_and_recall() {
+        let mut session = crate::harness::session::Session::default();
+        for turn in 1..=3 {
+            let user = session.push_user(format!("prompt number {turn}"));
+            let mut assistant = session.next_assistant(user);
+            assistant
+                .parts
+                .push(crate::harness::session::AssistantPart::Text(
+                    crate::harness::session::TextPart {
+                        id: format!("text-{turn}"),
+                        text: format!("answer number {turn}"),
+                        completed: true,
+                    },
+                ));
+            session.push_assistant(assistant);
+        }
+        // Two turns stay verbatim, so the summary sits alongside real prompts
+        // rather than replacing all of them.
+        let input = session.compaction_input(2, 90_000).unwrap();
+        session.compact_at("condensed context", input.preserve_from);
+        assert!(
+            session.messages.iter().any(|message| matches!(
+                message,
+                SessionMessage::User(user) if user.is_context_summary()
+            )),
+            "the session under test has to actually contain a summary turn"
+        );
+
+        let mut app = App::new();
+        app.load_session(&session);
+
+        let shown = app
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::User { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shown,
+            ["prompt number 2", "prompt number 3"],
+            "only real prompts belong in the transcript"
+        );
+
+        // Prompt recall reads the same transcript, so walking the whole history
+        // must never surface the summary in the composer.
+        for _ in 0..shown.len() + 1 {
+            app.navigate_prompt_history(-1);
+            assert!(
+                !app.composer.text().contains("condensed context"),
+                "prompt recall offered the compaction summary: {}",
+                app.composer.text()
+            );
+        }
+        assert_eq!(app.composer.text(), "prompt number 2");
     }
 
     #[test]
