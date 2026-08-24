@@ -462,12 +462,12 @@ fn effort_description(value: &str) -> &'static str {
     match value {
         "none" => "Disable model reasoning",
         "minimal" => "Minimal reasoning",
+        "default" => "Let the model choose how much to reason",
         "low" => "Faster, lighter reasoning",
         "medium" => "Balanced reasoning",
         "high" => "Deeper reasoning",
-        "xhigh" => "Extended reasoning",
+        "xhigh" => "Extended reasoning for long tasks",
         "max" => "Maximum model reasoning",
-        "ultra" => "Provider-defined ultra reasoning",
         _ => "Provider-supported reasoning effort",
     }
 }
