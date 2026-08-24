@@ -213,7 +213,6 @@ pub static COMMANDS: &[SlashCommand] = &[
     SlashCommand::plain("rewind", "Rewind to an earlier turn", "/rewind"),
     SlashCommand::plain("usage", "Show usage summary", "/usage"),
     SlashCommand::plain("queue", "Show queued prompts", "/queue"),
-    SlashCommand::plain("tasks", "Show background tasks", "/tasks"),
     SlashCommand::plain("release-notes", "Show release notes", "/release-notes"),
 ];
 
@@ -545,6 +544,7 @@ mod tests {
             "config-agents",
             "loop",
             "tutorial",
+            "tasks",
         ] {
             assert!(COMMANDS.iter().all(|command| command.name != name));
         }
