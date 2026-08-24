@@ -1476,6 +1476,70 @@ mod tests {
         }
     }
 
+    /// Reports a context window small enough to reason about together with the
+    /// occupancy the provider would return, so the automatic compaction
+    /// threshold can be exercised without a live provider.
+    struct ThresholdTransport {
+        window: u64,
+        reported: u64,
+        calls: AtomicU64,
+    }
+
+    impl ThresholdTransport {
+        fn new(window: u64, reported: u64) -> Self {
+            Self {
+                window,
+                reported,
+                calls: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl ModelTransport for ThresholdTransport {
+        fn context_window(&self) -> Option<u64> {
+            Some(self.window)
+        }
+
+        fn stream(
+            &self,
+            _request: ModelRequest,
+            on_event: &mut dyn FnMut(ModelEvent) -> Result<(), TransportError>,
+            cancellation: &CancellationToken,
+        ) -> Result<(), TransportError> {
+            cancellation.check()?;
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            on_event(ModelEvent::TextStarted { id: "t1".into() })?;
+            on_event(ModelEvent::TextDelta {
+                id: "t1".into(),
+                text: "Condensed answer".into(),
+            })?;
+            on_event(ModelEvent::TextFinished { id: "t1".into() })?;
+            on_event(ModelEvent::StepFinished {
+                reason: StopReason::Stop,
+                usage: Usage {
+                    context_tokens: self.reported,
+                    ..Usage::default()
+                },
+            })
+        }
+    }
+
+    fn drain_until_finished(harness: &Harness) -> Vec<HarnessEvent> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut events = Vec::new();
+        while Instant::now() < deadline {
+            events.extend(harness.drain_events());
+            if events
+                .iter()
+                .any(|event| matches!(event, HarnessEvent::RunFinished { .. }))
+            {
+                return events;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("timed out waiting for the run to finish");
+    }
+
     #[test]
     fn btw_uses_conversation_context_without_claiming_main_busy_state() {
         let harness = Harness::new(
@@ -1679,6 +1743,167 @@ mod tests {
         );
         assert_eq!(context_compaction_threshold(None, 85), None);
         assert_eq!(context_compaction_threshold(Some(200_000), 0), None);
+    }
+
+    #[test]
+    fn crossing_the_threshold_compacts_without_being_asked() {
+        // 900 of a 1,000 token window is 90%, past the 85% default.
+        let harness = Harness::new(
+            Arc::new(ThresholdTransport::new(1_000, 900)),
+            ToolRegistry::default(),
+            PermissionService::default(),
+            HarnessConfig::default(),
+        );
+        harness.submit("first request").unwrap();
+        let events = drain_until_finished(&harness);
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, HarnessEvent::CompactionStarted { .. })),
+            "occupancy past the threshold has to start compaction"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, HarnessEvent::CompactionFinished { .. }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            HarnessEvent::RunFinished {
+                outcome: RunOutcome::Completed,
+                ..
+            }
+        )));
+        assert!(matches!(
+            &harness.session_snapshot().messages[0],
+            session::SessionMessage::User(message)
+                if message.text.starts_with("[Conversation summary]")
+        ));
+    }
+
+    #[test]
+    fn staying_under_the_threshold_leaves_the_transcript_alone() {
+        // 800 of a 1,000 token window is 80%, short of the 85% default.
+        let harness = Harness::new(
+            Arc::new(ThresholdTransport::new(1_000, 800)),
+            ToolRegistry::default(),
+            PermissionService::default(),
+            HarnessConfig::default(),
+        );
+        harness.submit("first request").unwrap();
+        let events = drain_until_finished(&harness);
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, HarnessEvent::CompactionStarted { .. })),
+            "compaction must not run below the threshold"
+        );
+    }
+
+    #[test]
+    fn a_session_resumed_over_the_threshold_compacts_before_it_sends_anything() {
+        let harness = Harness::new(
+            Arc::new(ThresholdTransport::new(1_000, 900)),
+            ToolRegistry::default(),
+            PermissionService::default(),
+            HarnessConfig::default(),
+        );
+        // Stand in for a restored transcript that was already past the
+        // threshold when the session opened.
+        {
+            let mut session = harness
+                .session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let user = session.push_user("earlier work");
+            let mut assistant = session.next_assistant(user);
+            assistant.usage.context_tokens = 950;
+            session.push_assistant(assistant);
+        }
+
+        harness.submit("next request").unwrap();
+        let events = drain_until_finished(&harness);
+
+        let compaction = events
+            .iter()
+            .position(|event| matches!(event, HarnessEvent::CompactionStarted { .. }))
+            .expect("a session opening past the threshold has to compact");
+        let first_request = events
+            .iter()
+            .position(|event| matches!(event, HarnessEvent::WaitingForResponse { .. }))
+            .expect("the run has to reach the model");
+        assert!(
+            compaction < first_request,
+            "compaction has to precede the request it protects, got {compaction} then {first_request}"
+        );
+    }
+
+    #[test]
+    fn a_large_pending_prompt_counts_towards_the_threshold() {
+        // 800 of 1,000 sits under the threshold, so only the unmeasured prompt
+        // appended afterwards can push this run over it.
+        let harness = Harness::new(
+            Arc::new(ThresholdTransport::new(1_000, 800)),
+            ToolRegistry::default(),
+            PermissionService::default(),
+            HarnessConfig::default(),
+        );
+        {
+            let mut session = harness
+                .session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let user = session.push_user("earlier work");
+            let mut assistant = session.next_assistant(user);
+            assistant.usage.context_tokens = 800;
+            session.push_assistant(assistant);
+        }
+
+        harness.submit("pasted log line. ".repeat(40)).unwrap();
+        let events = drain_until_finished(&harness);
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, HarnessEvent::CompactionStarted { .. })),
+            "a prompt the provider has not measured yet still occupies the window"
+        );
+    }
+
+    #[test]
+    fn a_compacted_transcript_does_not_compact_again_on_the_next_turn() {
+        let transport = Arc::new(ThresholdTransport::new(1_000, 900));
+        let harness = Harness::new(
+            transport.clone(),
+            ToolRegistry::default(),
+            PermissionService::default(),
+            HarnessConfig::default(),
+        );
+        harness.submit("first request").unwrap();
+        let first = drain_until_finished(&harness);
+        assert_eq!(
+            first
+                .iter()
+                .filter(|event| matches!(event, HarnessEvent::CompactionStarted { .. }))
+                .count(),
+            1,
+            "the first turn should compact exactly once"
+        );
+
+        // The retained turn still carries the pre-compaction reading, so a
+        // second turn would compact again if that reading were trusted.
+        harness.submit("second request").unwrap();
+        let second = drain_until_finished(&harness);
+        let compactions = second
+            .iter()
+            .filter(|event| matches!(event, HarnessEvent::CompactionStarted { .. }))
+            .count();
+        assert_eq!(
+            compactions, 1,
+            "the second turn should compact once for its own fresh reading, not repeatedly"
+        );
     }
 
     #[test]
