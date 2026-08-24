@@ -72,6 +72,10 @@ pub struct ModelRecord {
     pub context_window: Option<u64>,
     #[serde(default)]
     pub supports_tools: Option<bool>,
+    #[serde(default)]
+    pub reasoning_efforts: Vec<String>,
+    #[serde(default)]
+    pub default_reasoning_effort: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -93,6 +97,8 @@ struct StoredCatalog {
     api_keys: BTreeMap<ProviderId, String>,
     #[serde(default)]
     cached_models: BTreeMap<ProviderId, Vec<ModelRecord>>,
+    #[serde(default)]
+    reasoning_efforts: BTreeMap<String, String>,
 }
 
 pub struct ProviderStore {
@@ -165,6 +171,67 @@ impl ProviderStore {
             model_name: model.name.clone(),
             context_window: model.context_window,
         });
+        let key = model_preference_key(provider, &model.id);
+        let valid_saved = self
+            .catalog
+            .reasoning_efforts
+            .get(&key)
+            .is_some_and(|value| model.reasoning_efforts.contains(value));
+        if !valid_saved {
+            if let Some(default) = model
+                .default_reasoning_effort
+                .as_ref()
+                .filter(|value| model.reasoning_efforts.contains(value))
+            {
+                self.catalog.reasoning_efforts.insert(key, default.clone());
+            } else {
+                self.catalog.reasoning_efforts.remove(&key);
+            }
+        }
+        self.persist()
+    }
+
+    pub fn active_reasoning_efforts(&self) -> &[String] {
+        let Some(active) = self.catalog.active.as_ref() else {
+            return &[];
+        };
+        self.cached_models(active.provider)
+            .iter()
+            .find(|model| model.id == active.model_id)
+            .map(|model| model.reasoning_efforts.as_slice())
+            .unwrap_or_default()
+    }
+
+    pub fn active_reasoning_effort(&self) -> Option<&str> {
+        let active = self.catalog.active.as_ref()?;
+        self.catalog
+            .reasoning_efforts
+            .get(&model_preference_key(active.provider, &active.model_id))
+            .map(String::as_str)
+    }
+
+    pub fn set_active_reasoning_effort(&mut self, effort: &str) -> io::Result<()> {
+        let active = self
+            .catalog
+            .active
+            .as_ref()
+            .ok_or_else(|| io::Error::other("No model is selected"))?;
+        let supported = self.active_reasoning_efforts();
+        if !supported.iter().any(|value| value == effort) {
+            let offered = if supported.is_empty() {
+                "none".to_string()
+            } else {
+                supported.join(", ")
+            };
+            return Err(io::Error::other(format!(
+                "{} does not expose reasoning effort {effort:?}; available: {offered}",
+                active.model_name
+            )));
+        }
+        let key = model_preference_key(active.provider, &active.model_id);
+        self.catalog
+            .reasoning_efforts
+            .insert(key, effort.to_string());
         self.persist()
     }
 
@@ -199,6 +266,10 @@ impl ProviderStore {
     fn at(path: PathBuf) -> Self {
         Self::from_optional_path(Some(path))
     }
+}
+
+fn model_preference_key(provider: ProviderId, model_id: &str) -> String {
+    format!("{provider:?}:{model_id}")
 }
 
 fn catalog_path() -> Option<PathBuf> {
@@ -411,6 +482,8 @@ fn parse_openai_list(
                     .unwrap_or_default(),
                 context_window: entry.get("context_window").and_then(Value::as_u64),
                 supports_tools: None,
+                reasoning_efforts: exposed_reasoning_efforts(entry),
+                default_reasoning_effort: exposed_default_effort(entry),
             })
         })
         .collect())
@@ -449,6 +522,8 @@ fn fetch_anthropic_models(
                 description: String::new(),
                 context_window: entry.get("max_input_tokens").and_then(Value::as_u64),
                 supports_tools: Some(true),
+                reasoning_efforts: exposed_reasoning_efforts(entry),
+                default_reasoning_effort: exposed_default_effort(entry),
             })
         }));
         if !value
@@ -516,6 +591,8 @@ fn fetch_gemini_models(
                     .to_string(),
                 context_window: entry.get("inputTokenLimit").and_then(Value::as_u64),
                 supports_tools: None,
+                reasoning_efforts: exposed_reasoning_efforts(entry),
+                default_reasoning_effort: exposed_default_effort(entry),
             })
         }));
         page_token = value
@@ -581,9 +658,42 @@ fn fetch_openrouter_models(
                     .to_string(),
                 context_window: entry.get("context_length").and_then(Value::as_u64),
                 supports_tools,
+                reasoning_efforts: exposed_reasoning_efforts(entry),
+                default_reasoning_effort: exposed_default_effort(entry),
             })
         })
         .collect())
+}
+
+fn exposed_reasoning_efforts(entry: &Value) -> Vec<String> {
+    let values = entry
+        .pointer("/reasoning/supported_efforts")
+        .or_else(|| entry.get("supported_reasoning_efforts"))
+        .or_else(|| entry.get("reasoning_efforts"))
+        .or_else(|| entry.pointer("/capabilities/reasoning_efforts"))
+        .and_then(Value::as_array);
+    let Some(values) = values else {
+        return Vec::new();
+    };
+    let allowed = [
+        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+    ];
+    let mut output = values
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|value| value.to_ascii_lowercase())
+        .filter(|value| allowed.contains(&value.as_str()))
+        .collect::<Vec<_>>();
+    output.dedup();
+    output
+}
+
+fn exposed_default_effort(entry: &Value) -> Option<String> {
+    entry
+        .pointer("/reasoning/default_effort")
+        .or_else(|| entry.get("default_reasoning_effort"))
+        .and_then(Value::as_str)
+        .map(|value| value.to_ascii_lowercase())
 }
 
 fn get_json(
@@ -685,6 +795,23 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_efforts_are_read_from_provider_model_metadata() {
+        let value = serde_json::json!({
+            "data": [{
+                "id": "reasoning-model",
+                "owned_by": "provider",
+                "reasoning": {
+                    "supported_efforts": ["max", "high", "low", "unsupported"],
+                    "default_effort": "high"
+                }
+            }]
+        });
+        let models = parse_openai_list(&value, false).unwrap();
+        assert_eq!(models[0].reasoning_efforts, ["max", "high", "low"]);
+        assert_eq!(models[0].default_reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
     fn provider_key_and_recent_model_survive_reload() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -698,6 +825,8 @@ mod tests {
             description: String::new(),
             context_window: Some(200_000),
             supports_tools: Some(true),
+            reasoning_efforts: vec!["low".to_string(), "high".to_string()],
+            default_reasoning_effort: Some("high".to_string()),
         };
         let mut store = ProviderStore::at(path.clone());
         store
@@ -719,6 +848,7 @@ mod tests {
         );
         assert_eq!(reloaded.cached_models(ProviderId::Anthropic), &[model]);
         assert_eq!(reloaded.active_context_window(), Some(200_000));
+        assert_eq!(reloaded.active_reasoning_effort(), Some("high"));
 
         fs::remove_file(path).unwrap();
         fs::remove_dir(root).unwrap();
