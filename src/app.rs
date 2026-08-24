@@ -11,7 +11,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     features::{self, BrowserAction, BrowserItem},
     harness::{
-        SessionMode, SessionSummary,
+        SessionMode, SessionSummary, UsageSnapshot,
         event::{FileDiff, HarnessEvent, PermissionReply, RunOutcome},
         session::{AssistantPart, Session, SessionMessage, ToolState},
     },
@@ -213,7 +213,40 @@ pub enum TranscriptEntry {
         expanded: bool,
         diffs: Vec<FileDiff>,
     },
+    Btw {
+        question: String,
+        answer: String,
+        expanded: bool,
+    },
+    Usage(UsageCard),
     Event(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BtwPanel {
+    Loading { question: String },
+    Done { question: String, answer: String },
+    Error { question: String, message: String },
+}
+
+impl BtwPanel {
+    pub fn question(&self) -> &str {
+        match self {
+            Self::Loading { question }
+            | Self::Done { question, .. }
+            | Self::Error { question, .. } => question,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageCard {
+    pub model: String,
+    pub directory: String,
+    pub permissions: String,
+    pub session: String,
+    pub context_used: u64,
+    pub context_window: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -378,6 +411,9 @@ pub enum SessionCommand {
     Doctor,
     Worktree,
     SelectRelease(String),
+    Btw(String),
+    OpenDocs,
+    Usage,
 }
 
 pub struct App {
@@ -402,7 +438,10 @@ pub struct App {
     pub hit_zones: HitZones,
     pub session_mode: SessionMode,
     pub multiline_mode: bool,
+    pub vim_mode: bool,
+    pub vim_insert_mode: bool,
     pub timestamps_enabled: bool,
+    pub btw_panel: Option<BtwPanel>,
     transcript_viewport: TranscriptViewport,
     transcript_scroll: usize,
     transcript_follow: bool,
@@ -421,6 +460,7 @@ pub struct App {
     provider_store: ProviderStore,
     model_discovery: ModelDiscovery,
     pending_provider_key: Option<(ProviderId, String)>,
+    last_plan: Option<String>,
 }
 
 impl App {
@@ -453,7 +493,10 @@ impl App {
             hit_zones: HitZones::default(),
             session_mode: SessionMode::Normal,
             multiline_mode: false,
+            vim_mode: false,
+            vim_insert_mode: true,
             timestamps_enabled: false,
+            btw_panel: None,
             transcript_viewport: TranscriptViewport::default(),
             transcript_scroll: 0,
             transcript_follow: true,
@@ -472,6 +515,7 @@ impl App {
             provider_store,
             model_discovery: ModelDiscovery::new(),
             pending_provider_key: None,
+            last_plan: None,
         }
     }
 
@@ -1054,10 +1098,12 @@ impl App {
     }
 
     pub fn refresh_slash(&mut self) {
+        let effort_values = self.provider_store.active_reasoning_efforts().to_vec();
         self.slash.refresh(
             self.composer.text(),
             self.composer.cursor(),
             self.theme_kind,
+            &effort_values,
         );
         if !self.slash.open {
             self.preview_theme = None;
@@ -1287,6 +1333,8 @@ impl App {
         self.tool_entries.clear();
         self.turn = None;
         self.permission = None;
+        self.btw_panel = None;
+        self.last_plan = None;
         self.composer.clear();
         self.close_slash();
         self.resume_panel = None;
@@ -1427,6 +1475,20 @@ impl App {
 
     pub fn apply_harness_event(&mut self, event: HarnessEvent) {
         match event {
+            HarnessEvent::BtwFinished {
+                question, result, ..
+            } => {
+                if self
+                    .btw_panel
+                    .as_ref()
+                    .is_some_and(|panel| panel.question() == question)
+                {
+                    self.btw_panel = Some(match result {
+                        Ok(answer) => BtwPanel::Done { question, answer },
+                        Err(message) => BtwPanel::Error { question, message },
+                    });
+                }
+            }
             HarnessEvent::SessionCreated {
                 session_id, title, ..
             } => {
@@ -1529,10 +1591,14 @@ impl App {
             }
             HarnessEvent::TextFinished { text_id, .. } => {
                 if let Some(index) = self.assistant_entries.remove(&text_id)
-                    && let Some(TranscriptEntry::Assistant { streaming, .. }) =
-                        self.transcript.get_mut(index)
+                    && let Some(TranscriptEntry::Assistant {
+                        text, streaming, ..
+                    }) = self.transcript.get_mut(index)
                 {
                     *streaming = false;
+                    if self.session_mode == SessionMode::Plan && !text.trim().is_empty() {
+                        self.last_plan = Some(text.clone());
+                    }
                 }
                 if self.assistant_entries.is_empty()
                     && self.thinking_entries.is_empty()
@@ -1656,7 +1722,8 @@ impl App {
     pub fn toggle_fold(&mut self, index: usize) {
         match self.transcript.get_mut(index) {
             Some(TranscriptEntry::Thinking { expanded, .. })
-            | Some(TranscriptEntry::Tool { expanded, .. }) => {
+            | Some(TranscriptEntry::Tool { expanded, .. })
+            | Some(TranscriptEntry::Btw { expanded, .. }) => {
                 *expanded = !*expanded;
                 self.text_selection = None;
             }
@@ -1685,6 +1752,39 @@ impl App {
         if let Some(turn) = self.turn.as_mut() {
             turn.set_activity(TurnActivity::Cancelling);
         }
+    }
+
+    pub fn dismiss_btw(&mut self) -> bool {
+        let Some(panel) = self.btw_panel.take() else {
+            return false;
+        };
+        match panel {
+            BtwPanel::Done { question, answer } => self.transcript.push(TranscriptEntry::Btw {
+                question,
+                answer,
+                expanded: false,
+            }),
+            BtwPanel::Error { question, message } => self.transcript.push(TranscriptEntry::Event(
+                format!("/btw {question}: {message}"),
+            )),
+            BtwPanel::Loading { .. } => {}
+        }
+        true
+    }
+
+    pub fn set_vim_insert_mode(&mut self, insert: bool) {
+        self.vim_insert_mode = insert;
+    }
+
+    pub fn report_usage(&mut self, snapshot: UsageSnapshot) {
+        self.transcript.push(TranscriptEntry::Usage(UsageCard {
+            model: snapshot.model,
+            directory: snapshot.directory,
+            permissions: snapshot.permissions,
+            session: snapshot.session,
+            context_used: snapshot.context_used,
+            context_window: snapshot.context_window,
+        }));
     }
 
     fn set_turn_activity(&mut self, activity: TurnActivity) {
@@ -1804,6 +1904,13 @@ impl App {
         };
 
         if command.arguments_required && args.is_empty() {
+            if command.name == "effort" && self.provider_store.active_reasoning_efforts().is_empty()
+            {
+                self.transcript.push(TranscriptEntry::Event(
+                    "The selected model does not expose reasoning effort levels.".to_string(),
+                ));
+                return true;
+            }
             self.transcript
                 .push(TranscriptEntry::Event(format!("Usage: {}", command.usage)));
             return true;
@@ -1811,6 +1918,7 @@ impl App {
 
         match command.name {
             "quit" => self.running = false,
+            "docs" => self.pending_session_command = Some(SessionCommand::OpenDocs),
             "new" => self.pending_session_command = Some(SessionCommand::New),
             "fork" => self.pending_session_command = Some(SessionCommand::Fork),
             "resume" => self.pending_session_command = Some(SessionCommand::OpenResume),
@@ -1923,7 +2031,8 @@ impl App {
                 for entry in &mut self.transcript {
                     match entry {
                         TranscriptEntry::Thinking { expanded, .. }
-                        | TranscriptEntry::Tool { expanded, .. } => *expanded = true,
+                        | TranscriptEntry::Tool { expanded, .. }
+                        | TranscriptEntry::Btw { expanded, .. } => *expanded = true,
                         _ => {}
                     }
                 }
@@ -1939,6 +2048,18 @@ impl App {
                     });
                 }
                 None => self.report_session_error("Usage: /multiline [on|off]"),
+            },
+            "vim-mode" => match parse_toggle(args, self.vim_mode) {
+                Some(enabled) => {
+                    self.vim_mode = enabled;
+                    self.vim_insert_mode = true;
+                    self.report_session_error(if enabled {
+                        "Vim input enabled in INSERT mode. Press Esc for NORMAL mode."
+                    } else {
+                        "Vim input disabled."
+                    });
+                }
+                None => self.report_session_error("Usage: /vim-mode [on|off]"),
             },
             "timestamps" => match parse_toggle(args, self.timestamps_enabled) {
                 Some(enabled) => {
@@ -1966,6 +2087,17 @@ impl App {
                     self.open_document("Skills", "No installed skills were found.");
                 } else {
                     self.open_browser_catalog("Installed skills", items);
+                }
+            }
+            "workflows" => {
+                let items = features::installed_workflows(&self.cwd);
+                if items.is_empty() {
+                    self.open_document(
+                        "Workflows",
+                        "No saved workflows were found. Add Markdown workflow definitions under .indus/workflows in this project or ~/.indus/workflows.",
+                    );
+                } else {
+                    self.open_browser_catalog("Saved workflows", items);
                 }
             }
             "history" => {
@@ -2032,6 +2164,31 @@ impl App {
                 persist_theme_preference(next);
             }
             "model" => self.open_provider_catalog(),
+            "effort" => {
+                match self.provider_store.set_active_reasoning_effort(args) {
+                    Ok(()) => self.report_session_error(format!(
+                        "Reasoning effort set to {args} for the selected model."
+                    )),
+                    Err(error) => self.report_session_error(error.to_string()),
+                }
+                self.refresh_slash();
+            }
+            "btw" => {
+                self.btw_panel = Some(BtwPanel::Loading {
+                    question: args.to_string(),
+                });
+                self.pending_session_command = Some(SessionCommand::Btw(args.to_string()));
+            }
+            "view-plan" => {
+                if let Some(plan) = self.last_plan.clone() {
+                    self.open_document("Current plan", plan);
+                } else {
+                    self.report_session_error(
+                        "No plan has been produced in this session yet. Switch to Plan mode and ask Indus to create one.",
+                    );
+                }
+            }
+            "usage" => self.pending_session_command = Some(SessionCommand::Usage),
             "help" => self.transcript.push(TranscriptEntry::Event(
                 "Type / to browse commands. Use Tab to complete and Enter to run.".to_string(),
             )),
@@ -2054,6 +2211,16 @@ fn transcript_entry_text(entry: &TranscriptEntry) -> (&'static str, String) {
             output,
             ..
         } => ("Tool", format!("{name}\nInput: {input}\nOutput: {output}")),
+        TranscriptEntry::Btw {
+            question, answer, ..
+        } => ("BTW", format!("{question}\n{answer}")),
+        TranscriptEntry::Usage(card) => (
+            "Usage",
+            format!(
+                "{} {} {} {} {}",
+                card.model, card.directory, card.permissions, card.session, card.context_used
+            ),
+        ),
         TranscriptEntry::Event(text) => ("Event", text.clone()),
     }
 }
@@ -2373,6 +2540,74 @@ mod tests {
         app.composer.set("/rewind");
         app.submit();
         assert_eq!(app.take_session_command(), Some(SessionCommand::Rewind));
+    }
+
+    #[test]
+    fn docs_usage_btw_and_vim_commands_open_functional_paths() {
+        let mut app = App::new();
+
+        app.composer.set("/docs");
+        app.submit();
+        assert_eq!(app.take_session_command(), Some(SessionCommand::OpenDocs));
+
+        app.composer.set("/usage");
+        app.submit();
+        assert_eq!(app.take_session_command(), Some(SessionCommand::Usage));
+
+        app.composer.set("/vim-mode on");
+        app.submit();
+        assert!(app.vim_mode && app.vim_insert_mode);
+
+        app.composer.set("/btw what changed?");
+        app.submit();
+        assert_eq!(
+            app.take_session_command(),
+            Some(SessionCommand::Btw("what changed?".to_string()))
+        );
+        app.apply_harness_event(HarnessEvent::BtwFinished {
+            request_id: 1,
+            question: "what changed?".to_string(),
+            result: Ok("Only the command layer.".to_string()),
+        });
+        assert!(matches!(app.btw_panel, Some(BtwPanel::Done { .. })));
+        assert!(app.dismiss_btw());
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptEntry::Btw {
+                expanded: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn plan_response_is_available_to_view_plan() {
+        let mut app = App::new();
+        app.session_mode = SessionMode::Plan;
+        app.composer.set("plan this change");
+        app.submit();
+        app.apply_harness_event(HarnessEvent::TextStarted {
+            run_id: 1,
+            text_id: "plan".into(),
+        });
+        app.apply_harness_event(HarnessEvent::TextDelta {
+            run_id: 1,
+            text_id: "plan".into(),
+            text: "1. Inspect\n2. Implement".into(),
+        });
+        app.apply_harness_event(HarnessEvent::TextFinished {
+            run_id: 1,
+            text_id: "plan".into(),
+        });
+
+        app.composer.set("/view-plan");
+        app.submit();
+        assert!(app.browser_panel.as_ref().is_some_and(|panel| {
+            panel
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.body.contains("2. Implement"))
+        }));
     }
 
     #[test]
