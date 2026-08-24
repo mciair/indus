@@ -97,6 +97,51 @@ pub fn installed_skills(cwd: &Path) -> Vec<BrowserItem> {
     items
 }
 
+pub fn installed_workflows(cwd: &Path) -> Vec<BrowserItem> {
+    let mut files = Vec::new();
+    for root in workflow_roots(cwd) {
+        collect_markdown_files(&root, 0, &mut files);
+    }
+    files.sort();
+    files.dedup();
+    files
+        .into_iter()
+        .filter_map(|path| {
+            let source = fs::read_to_string(&path).ok()?;
+            let title = source
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("# "))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    path.file_stem()
+                        .map(|name| name.to_string_lossy().replace(['-', '_'], " "))
+                })?;
+            let description = source
+                .lines()
+                .map(str::trim)
+                .find(|line| {
+                    !line.is_empty()
+                        && !line.starts_with('#')
+                        && !line.starts_with("---")
+                        && !line.starts_with("name:")
+                        && !line.starts_with("description:")
+                })
+                .unwrap_or("Saved Indus workflow")
+                .chars()
+                .take(100)
+                .collect();
+            Some(BrowserItem {
+                title,
+                description,
+                body: format!("{}\n\nSource\n{}", source.trim(), path.display()),
+                action: BrowserAction::None,
+            })
+        })
+        .collect()
+}
+
 pub fn prompt_skill_instructions(prompt: &str, cwd: &Path) -> Vec<String> {
     let requested = prompt
         .split_whitespace()
@@ -140,6 +185,31 @@ fn skill_roots(cwd: &Path) -> Vec<PathBuf> {
         roots.push(home.join(".codex/skills"));
     }
     roots
+}
+
+fn workflow_roots(cwd: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![cwd.join(".indus/workflows")];
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        roots.push(home.join(".indus/workflows"));
+    }
+    roots
+}
+
+fn collect_markdown_files(root: &Path, depth: usize, output: &mut Vec<PathBuf>) {
+    if depth > 4 || !root.is_dir() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_markdown_files(&path, depth + 1, output);
+        } else if path.extension().is_some_and(|extension| extension == "md") {
+            output.push(path);
+        }
+    }
 }
 
 fn collect_skill_files(root: &Path, depth: usize, output: &mut Vec<PathBuf>) {
