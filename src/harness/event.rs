@@ -43,6 +43,11 @@ pub struct FileDiff {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HarnessEvent {
+    BtwFinished {
+        request_id: u64,
+        question: String,
+        result: Result<String, String>,
+    },
     SessionCreated {
         run_id: u64,
         session_id: String,
