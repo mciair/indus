@@ -60,9 +60,6 @@ indus --version
 indus
 ```
 
-Every distribution method installs the command aliases `indus`, `indus-cli`,
-`induscli`, `indusai`, `indus-ai`, `mantra`, and `mantra-ai`.
-
 ## Building from source
 
 ### Requirements
