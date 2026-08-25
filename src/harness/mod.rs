@@ -18,6 +18,7 @@ use std::{
     error::Error,
     fmt,
     panic::{AssertUnwindSafe, catch_unwind},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -127,6 +128,7 @@ pub struct Harness {
     jobs: JobService,
     session_store: Option<SessionStore>,
     mode: Arc<Mutex<SessionMode>>,
+    cwd: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,6 +149,7 @@ impl Harness {
         config: HarnessConfig,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             transport,
             tools,
@@ -162,6 +165,7 @@ impl Harness {
             jobs: JobService::load(),
             session_store: None,
             mode: Arc::new(Mutex::new(SessionMode::Normal)),
+            cwd,
         }
     }
 
@@ -172,15 +176,13 @@ impl Harness {
     pub fn configured_with_session(session_id: Option<&str>) -> Result<Self, TransportError> {
         let transport: Arc<dyn ModelTransport> = Arc::new(ProviderTransport::new()?);
         let jobs = JobService::load();
-        let tools = builtin_tools::registry(jobs.clone());
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let tools = builtin_tools::registry_at(jobs.clone(), cwd.clone());
         let permissions = PermissionService::new(default_permission_rules());
         let session_store = SessionStore::database().map_err(|error| {
             TransportError::fatal(format!("Could not initialize session history: {error:#}"))
         })?;
-        let directory = std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
+        let directory = cwd.to_string_lossy().into_owned();
         let session = match session_id {
             Some(id) => session_store
                 .load(id)
@@ -209,6 +211,7 @@ impl Harness {
             jobs,
             session_store: Some(session_store),
             mode: Arc::new(Mutex::new(SessionMode::Normal)),
+            cwd,
         })
     }
 
@@ -231,13 +234,34 @@ impl Harness {
         if self.is_busy() {
             return Err(anyhow::anyhow!(HarnessError::Busy));
         }
-        let directory = std::env::current_dir()?.to_string_lossy().into_owned();
+        let directory = self.cwd.to_string_lossy().into_owned();
         let session = Session::unallocated(directory);
         *self
             .session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = session.clone();
         Ok(session)
+    }
+
+    pub fn change_directory(&mut self, value: &str) -> anyhow::Result<PathBuf> {
+        if self.is_busy() {
+            return Err(anyhow::anyhow!(HarnessError::Busy));
+        }
+        let directory = resolve_working_directory(&self.cwd, value)?;
+        self.tools = builtin_tools::registry_at(self.jobs.clone(), directory.clone());
+        self.cwd = directory.clone();
+
+        let mut session = self
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        session.directory = directory.to_string_lossy().into_owned();
+        if session.is_allocated()
+            && let Some(store) = &self.session_store
+        {
+            store.save(&session)?;
+        }
+        Ok(directory)
     }
 
     pub fn resume_session(&self, session_id: &str) -> anyhow::Result<Session> {
@@ -434,10 +458,7 @@ impl Harness {
         }
 
         let run_id = self.next_run_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let turn_system = crate::features::prompt_skill_instructions(
-            &prompt,
-            &std::env::current_dir().unwrap_or_default(),
-        );
+        let turn_system = crate::features::prompt_skill_instructions(&prompt, &self.cwd);
         let selection = crate::provider::ProviderStore::load()
             .active_selection()
             .cloned();
@@ -581,10 +602,7 @@ impl Harness {
         UsageSnapshot {
             model,
             directory: if session.directory.is_empty() {
-                std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
+                self.cwd.to_string_lossy().into_owned()
             } else {
                 session.directory.clone()
             },
@@ -786,6 +804,52 @@ impl Harness {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         });
     }
+}
+
+fn resolve_working_directory(current: &Path, input: &str) -> anyhow::Result<PathBuf> {
+    let value = input.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+        .unwrap_or(value);
+    if value.is_empty() {
+        return Err(anyhow::anyhow!("Usage: /cd <directory>"));
+    }
+
+    let path = if value == "~" || value.starts_with("~/") || value.starts_with("~\\") {
+        let home = home_directory()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine the home directory"))?;
+        if value == "~" {
+            home
+        } else {
+            home.join(&value[2..])
+        }
+    } else {
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            path
+        } else {
+            current.join(path)
+        }
+    };
+    let directory = path
+        .canonicalize()
+        .map_err(|error| anyhow::anyhow!("Could not open directory {}: {error}", path.display()))?;
+    if !directory.is_dir() {
+        return Err(anyhow::anyhow!("Not a directory: {}", directory.display()));
+    }
+    Ok(directory)
+}
+
+fn home_directory() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
 impl Default for Harness {
@@ -1457,6 +1521,29 @@ mod tests {
         permission::{PermissionAction, PermissionRule},
         tool::{HarnessTool, ToolError, ToolOutput, ToolPermission},
     };
+
+    #[test]
+    fn working_directory_resolution_accepts_relative_quoted_paths_and_rejects_files() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("indus-cd-{unique}"));
+        let nested = root.join("project with spaces");
+        fs::create_dir_all(&nested).unwrap();
+        let resolved = resolve_working_directory(&root, "\"project with spaces\"").unwrap();
+        assert_eq!(resolved, nested.canonicalize().unwrap());
+
+        let file = root.join("not-a-directory");
+        fs::write(&file, "content").unwrap();
+        assert!(
+            resolve_working_directory(&root, "not-a-directory")
+                .unwrap_err()
+                .to_string()
+                .contains("Not a directory")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     struct TextTransport;
 
