@@ -1,0 +1,31 @@
+{
+  "name": "indus-ai",
+  "version": "0.1.0",
+  "description": "India's first AI-native command-line (CLI) coding agent, built by Mantra [MCIAIR]",
+  "license": "Apache-2.0",
+  "homepage": "https://docs.mciair.in",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mciair/indus.git"
+  },
+  "bin": {
+    "indus-ai": "bin/indus-ai.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "indus-cli": "0.1.0"
+  },
+  "keywords": [
+    "ai",
+    "cli",
+    "coding-agent",
+    "indus",
+    "mciair"
+  ]
+}
