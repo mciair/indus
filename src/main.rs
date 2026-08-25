@@ -31,7 +31,17 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use slash::CompletionPhase;
 
 fn main() -> Result<()> {
-    let resume_id = parse_resume_argument()?;
+    let resume_id = match parse_startup_action(env::args().skip(1))? {
+        StartupAction::Launch { resume_id } => resume_id,
+        StartupAction::Help => {
+            print!("{}", help_text());
+            return Ok(());
+        }
+        StartupAction::Version => {
+            println!("indus {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+    };
     let mut harness = Harness::configured_with_session(resume_id.as_deref())?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -907,11 +917,40 @@ fn unix_millis() -> u128 {
         .as_millis()
 }
 
-fn parse_resume_argument() -> Result<Option<String>> {
-    let mut arguments = env::args().skip(1);
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StartupAction {
+    Launch { resume_id: Option<String> },
+    Help,
+    Version,
+}
+
+fn help_text() -> String {
+    format!(
+        "Indus {}\nIndia's first AI-native command-line (CLI) coding agent, built by Mantra [MCIAIR]\n\n\
+Usage:\n  indus\n  indus --resume <SESSION_ID>\n  indus [OPTIONS]\n\n\
+Options:\n  --resume <SESSION_ID>  Resume a saved Indus session\n  -h, --help             Print help\n  -V, --version          Print version\n\n\
+Command aliases:\n  indus, indus-cli, induscli, indusai, indus-ai, mantra, mantra-ai\n",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn parse_startup_action(arguments: impl IntoIterator<Item = String>) -> Result<StartupAction> {
+    let mut arguments = arguments.into_iter();
     let Some(argument) = arguments.next() else {
-        return Ok(None);
+        return Ok(StartupAction::Launch { resume_id: None });
     };
+    if matches!(argument.as_str(), "--help" | "-h") {
+        if arguments.next().is_some() {
+            return Err(anyhow::anyhow!("Usage: indus --help"));
+        }
+        return Ok(StartupAction::Help);
+    }
+    if matches!(argument.as_str(), "--version" | "-V") {
+        if arguments.next().is_some() {
+            return Err(anyhow::anyhow!("Usage: indus --version"));
+        }
+        return Ok(StartupAction::Version);
+    }
     let session_id = if argument == "--resume" {
         arguments
             .next()
@@ -920,7 +959,7 @@ fn parse_resume_argument() -> Result<Option<String>> {
         session_id.to_string()
     } else {
         return Err(anyhow::anyhow!(
-            "Unknown argument: {argument}. Usage: indus [--resume ses-i_…]"
+            "Unknown argument: {argument}. Usage: indus [--resume ses-i_…] | indus --version"
         ));
     };
     if arguments.next().is_some() {
@@ -929,7 +968,9 @@ fn parse_resume_argument() -> Result<Option<String>> {
     if !session_id.starts_with("ses-i_") || session_id.len() <= "ses-i_".len() {
         return Err(anyhow::anyhow!("Invalid Indus session ID: {session_id}"));
     }
-    Ok(Some(session_id))
+    Ok(StartupAction::Launch {
+        resume_id: Some(session_id),
+    })
 }
 
 fn contains(area: ratatui::layout::Rect, x: u16, y: u16) -> bool {
@@ -1019,7 +1060,9 @@ fn encode_base64(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_base64, handle_key, resume_hint};
+    use super::{
+        StartupAction, encode_base64, handle_key, help_text, parse_startup_action, resume_hint,
+    };
     use crate::{
         app::App,
         harness::{Harness, session::Session},
@@ -1047,6 +1090,48 @@ mod tests {
     #[test]
     fn unallocated_conversations_do_not_print_a_resume_command() {
         assert_eq!(resume_hint(&Session::unallocated("/workspace")), None);
+    }
+
+    #[test]
+    fn version_flags_exit_before_launching_the_tui() {
+        assert_eq!(
+            parse_startup_action(["--version".to_string()]).unwrap(),
+            StartupAction::Version
+        );
+        assert_eq!(
+            parse_startup_action(["-V".to_string()]).unwrap(),
+            StartupAction::Version
+        );
+    }
+
+    #[test]
+    fn help_flags_describe_launch_resume_aliases_and_version() {
+        assert_eq!(
+            parse_startup_action(["--help".to_string()]).unwrap(),
+            StartupAction::Help
+        );
+        assert_eq!(
+            parse_startup_action(["-h".to_string()]).unwrap(),
+            StartupAction::Help
+        );
+        let help = help_text();
+        assert!(help.contains(
+            "India's first AI-native command-line (CLI) coding agent, built by Mantra [MCIAIR]"
+        ));
+        assert!(help.contains("--resume <SESSION_ID>"));
+        assert!(help.contains("--version"));
+        assert!(help.contains("indus-ai"));
+        assert!(help.contains("mantra-ai"));
+    }
+
+    #[test]
+    fn resume_argument_remains_compatible_with_session_ids() {
+        assert_eq!(
+            parse_startup_action(["--resume".to_string(), "ses-i_example".to_string()]).unwrap(),
+            StartupAction::Launch {
+                resume_id: Some("ses-i_example".to_string())
+            }
+        );
     }
 
     #[test]
