@@ -7,11 +7,13 @@
 </h1>
 
 **Indus** is **India's first AI-native command-line (CLI) coding agent**, built by
-Mantra [[MCIAIR]](https://mciair.in). It brings a full-screen, mouse-aware TUI together
+**Mantra [[MCIAIR]](https://mciair.in)**. It brings a full-screen, mouse-aware
+TUI together
 with an agent harness that can understand repositories, edit files, run
 commands, search the web, manage sessions, and carry long-running work forward.
 
-[Getting started](#getting-started) ·
+[Installing the released binary](#installing-the-released-binary) ·
+[Building from source](#building-from-source) ·
 [Capabilities](#capabilities) ·
 [Compatible Interim Providers](#compatible-interim-providers) ·
 [Documentation](#documentation) ·
@@ -31,7 +33,37 @@ remain visible, and saved sessions can be resumed without losing context.
 
 ---
 
-## Getting started
+## Installing the released binary
+
+Install the latest native binary on macOS, Linux, or Git Bash:
+
+```sh
+curl -fsSL https://mciair.in/indus/cli/install.sh | bash
+```
+
+Install on Windows PowerShell:
+
+```powershell
+irm https://mciair.in/indus/cli/install.ps1 | iex
+```
+
+Or install through npm:
+
+```sh
+npm install --global indus-cli
+```
+
+Verify the installation, then launch the TUI:
+
+```sh
+indus --version
+indus
+```
+
+Every distribution method installs the command aliases `indus`, `indus-cli`,
+`induscli`, `indusai`, `indus-ai`, `mantra`, and `mantra-ai`.
+
+## Building from source
 
 ### Requirements
 
@@ -39,8 +71,6 @@ remain visible, and saved sessions can be resumed without losing context.
 - Git
 - A native C/C++ build toolchain for Rust dependencies
 - An API key for one of the supported Compatible Interim Providers
-
-### Build and install from source
 
 ```sh
 git clone https://github.com/mciair/indus.git
@@ -98,6 +128,13 @@ allocated session, the terminal prints the exact resume command.
 | `Up` / `Down` | Recall previously sent prompts |
 | `Page Up` / `Page Down` | Move through transcript scrollback |
 | `/` | Browse commands and their arguments |
+
+Command-line information is available without opening the TUI:
+
+```sh
+indus --help
+indus --version
+```
 
 Useful starting commands include `/model`, `/resume`, `/new`, `/plan`,
 `/view-plan`, `/usage`, `/doctor`, `/skills`, `/mcps`, `/workflows`, and
