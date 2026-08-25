@@ -27,8 +27,7 @@ const MAX_READ_LINES: usize = 2_000;
 const MAX_LINE_BYTES: usize = 2_000;
 const MAX_WEB_BYTES: usize = 5 * 1024 * 1024;
 
-pub fn registry(jobs: JobService) -> ToolRegistry {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+pub fn registry_at(jobs: JobService, cwd: PathBuf) -> ToolRegistry {
     let registry = ToolRegistry::default();
     registry.register(ReadTool { cwd: cwd.clone() });
     registry.register(GlobTool { cwd: cwd.clone() });
