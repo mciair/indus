@@ -398,6 +398,7 @@ pub enum SessionCommand {
     OpenResume,
     Resume(String),
     New,
+    ChangeDirectory(String),
     EditPrompt,
     Copy(String),
     Rename(String),
@@ -2087,6 +2088,9 @@ impl App {
         match command.name {
             "quit" => self.running = false,
             "docs" => self.pending_session_command = Some(SessionCommand::OpenDocs),
+            "cd" => {
+                self.pending_session_command = Some(SessionCommand::ChangeDirectory(args.into()))
+            }
             "new" => self.pending_session_command = Some(SessionCommand::New),
             "fork" => self.pending_session_command = Some(SessionCommand::Fork),
             "resume" => self.pending_session_command = Some(SessionCommand::OpenResume),
@@ -2649,6 +2653,15 @@ mod tests {
         app.composer.set("/new");
         app.submit();
         assert_eq!(app.take_session_command(), Some(SessionCommand::New));
+
+        app.composer.set("/cd ../project with spaces");
+        app.submit();
+        assert_eq!(
+            app.take_session_command(),
+            Some(SessionCommand::ChangeDirectory(
+                "../project with spaces".into()
+            ))
+        );
     }
 
     #[test]
