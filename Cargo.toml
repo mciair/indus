@@ -2,7 +2,7 @@
 name = "indus"
 version = "0.1.0"
 edition = "2024"
-description = "India's AI-native CLI"
+description = "India's first AI-native command-line (CLI) coding agent, built by Mantra [MCIAIR]"
 license = "Apache-2.0"
 
 [[bin]]
