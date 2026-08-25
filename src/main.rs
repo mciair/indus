@@ -660,6 +660,20 @@ fn dispatch_app_commands(
                     }
                 }
             }
+            SessionCommand::ChangeDirectory(directory) => {
+                match harness.change_directory(&directory) {
+                    Ok(directory) => {
+                        app.cwd = directory.clone();
+                        app.report_session_error(format!(
+                            "Working directory changed to {}.",
+                            directory.display()
+                        ));
+                    }
+                    Err(error) => app.report_session_error(format!(
+                        "Could not change the working directory: {error:#}"
+                    )),
+                }
+            }
             SessionCommand::EditPrompt => match harness.edit_previous_prompt() {
                 Ok((session, prompt)) => app.restore_edited_prompt(&session, prompt),
                 Err(error) => app
