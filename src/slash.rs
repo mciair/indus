@@ -86,6 +86,14 @@ pub static COMMANDS: &[SlashCommand] = &[
     SlashCommand::plain("help", "Show available commands", "/help"),
     SlashCommand::plain("docs", "Open documentation", "/docs"),
     SlashCommand::plain("home", "Return to the home screen", "/home"),
+    SlashCommand::with_args(
+        "cd",
+        "Change the working directory",
+        "/cd <directory>",
+        "<directory>",
+        true,
+        ArgumentSource::None,
+    ),
     SlashCommand::plain("delete", "Delete the current session", "/delete"),
     SlashCommand::plain("new", "Start a new session", "/new"),
     SlashCommand::plain("fork", "Fork the current session", "/fork"),
@@ -576,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_persona_and_dashboard_commands_are_hidden() {
+    fn unavailable_commands_stay_hidden_while_cd_is_registered() {
         let names = COMMANDS
             .iter()
             .map(|command| command.name)
@@ -585,7 +593,7 @@ mod tests {
         assert!(!names.contains(&"dashboard"));
         assert!(names.contains(&"compact"));
         assert!(!names.contains(&"compact-mode"));
-        assert!(!names.contains(&"cd"));
+        assert!(names.contains(&"cd"));
     }
 
     #[test]
