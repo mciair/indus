@@ -7,7 +7,7 @@
 </h1>
 
 **Indus** is **India's first AI-native command-line (CLI) coding agent**, built by
-**Mantra [[MCIAIR]](https://mciair.in)**. It brings a full-screen, mouse-aware
+**Mantra [[MCIAIR](https://mciair.in)]**. It brings a full-screen, mouse-aware
 TUI together
 with an agent harness that can understand repositories, edit files, run
 commands, search the web, manage sessions, and carry long-running work forward.
